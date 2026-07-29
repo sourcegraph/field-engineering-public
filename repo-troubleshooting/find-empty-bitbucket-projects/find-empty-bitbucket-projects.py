@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_FILE = "bitbucket-project-repo-counts.csv"
 DEFAULT_MAX_RETRIES = 5
+DEFAULT_PARALLELISM = 8
 DEFAULT_REPOSITORY_PATH_PATTERN = "{host}/{projectKey}/{repositorySlug}"
 EXTERNAL_SERVICES_PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
@@ -694,63 +696,79 @@ def count_and_report(
     items: list[ConfigItem],
     output_path: Path,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    parallelism: int = DEFAULT_PARALLELISM,
 ) -> None:
-    """Search per config item, logging each count and writing the CSV"""
+    """Search per config item, logging each count and writing the CSV
+
+    Runs up to `parallelism` searches concurrently; logs and CSV rows keep
+    the original item order
+    """
     empty_items: list[ConfigItem] = []
-    with output_path.open("w", newline="") as output_file:
-        writer = csv.writer(output_file)
-        writer.writerow(CSV_COLUMNS)
-        for index, config_item in enumerate(items, start=1):
-            position = f"[{index}/{len(items)}]"
-            connection = config_item.connection
-            label = (
-                f"{connection.display_name} ({connection.url}, "
-                f"username {connection.username}) "
-                f"{config_item.config_field} {config_item.item!r}"
-            )
+    with ThreadPoolExecutor(max_workers=parallelism) as executor:
+        search_queries: dict[int, str] = {}
+        counts: dict[int, Future[RepositoryCount]] = {}
+        for index, config_item in enumerate(items):
             if config_item.project_key is None:
-                logger.info(
-                    "%s %s: skipped (%s)", position, label, config_item.skip_note
-                )
-                writer.writerow(csv_row(config_item, note=config_item.skip_note or ""))
                 continue
             search_query = project_search_query(
                 config_item.connection,
                 config_item.project_key,
             )
-            count = fetch_repository_count(
+            search_queries[index] = search_query
+            counts[index] = executor.submit(
+                fetch_repository_count,
                 endpoint,
                 token,
                 search_query,
                 max_retries=max_retries,
             )
-            note = ""
-            if count.error is not None:
-                note = f"search failed: {count.error}"
-                logger.warning("%s %s: %s", position, label, note)
-            else:
-                logger.info(
-                    "%s %s: %s repo(s)%s%s",
-                    position,
-                    label,
-                    count.repository_count,
-                    " (limit hit)" if count.limit_hit else "",
-                    f" alert={count.alert_title!r}" if count.alert_title else "",
+        with output_path.open("w", newline="") as output_file:
+            writer = csv.writer(output_file)
+            writer.writerow(CSV_COLUMNS)
+            for index, config_item in enumerate(items):
+                position = f"[{index + 1}/{len(items)}]"
+                connection = config_item.connection
+                label = (
+                    f"{connection.display_name} ({connection.url}, "
+                    f"username {connection.username}) "
+                    f"{config_item.config_field} {config_item.item!r}"
                 )
-                if count.repository_count == 0:
-                    empty_items.append(config_item)
-            writer.writerow(
-                csv_row(
-                    config_item,
-                    search_query=search_query,
-                    repository_count=count.repository_count
-                    if count.repository_count is not None
-                    else "",
-                    limit_hit=count.limit_hit,
-                    alert_title=count.alert_title or "",
-                    note=note,
-                ),
-            )
+                if config_item.project_key is None:
+                    logger.info(
+                        "%s %s: skipped (%s)", position, label, config_item.skip_note
+                    )
+                    writer.writerow(
+                        csv_row(config_item, note=config_item.skip_note or ""),
+                    )
+                    continue
+                count = counts[index].result()
+                note = ""
+                if count.error is not None:
+                    note = f"search failed: {count.error}"
+                    logger.warning("%s %s: %s", position, label, note)
+                else:
+                    logger.info(
+                        "%s %s: %s repo(s)%s%s",
+                        position,
+                        label,
+                        count.repository_count,
+                        " (limit hit)" if count.limit_hit else "",
+                        f" alert={count.alert_title!r}" if count.alert_title else "",
+                    )
+                    if count.repository_count == 0:
+                        empty_items.append(config_item)
+                writer.writerow(
+                    csv_row(
+                        config_item,
+                        search_query=search_queries[index],
+                        repository_count=count.repository_count
+                        if count.repository_count is not None
+                        else "",
+                        limit_hit=count.limit_hit,
+                        alert_title=count.alert_title or "",
+                        note=note,
+                    ),
+                )
     logger.info("Wrote %d row(s) to %s", len(items), output_path.name)
     if empty_items:
         logger.info(
@@ -859,6 +877,15 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def positive_int(value: str) -> int:
+    """argparse type for integers >= 1"""
+    parsed = non_negative_int(value)
+    if parsed < 1:
+        msg = f"must be a positive integer (>=1), got {parsed}"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments into a Namespace"""
     parser = argparse.ArgumentParser(
@@ -874,6 +901,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
+        "-o",
         default=None,
         metavar="FILE",
         help=(
@@ -881,7 +909,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--max-retries",
+        "--parallelism",
+        "-p",
+        type=positive_int,
+        default=DEFAULT_PARALLELISM,
+        metavar="int",
+        help=(
+            "Number of repo-count searches to run in parallel "
+            f"(default {DEFAULT_PARALLELISM}); higher is faster but adds "
+            "load on the Sourcegraph instance"
+        ),
+    )
+    parser.add_argument(
+        "--retries",
+        "-r",
         type=non_negative_int,
         default=DEFAULT_MAX_RETRIES,
         metavar="int",
@@ -922,7 +963,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     current_user = fetch_current_user(
         endpoint,
         token,
-        max_retries=args.max_retries,
+        max_retries=args.retries,
     )
     if current_user is None:
         die(
@@ -946,7 +987,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     connections = fetch_bitbucket_connections(
         endpoint,
         token,
-        max_retries=args.max_retries,
+        max_retries=args.retries,
     )
     items = collect_config_items(connections)
     if not items:
@@ -961,7 +1002,8 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         token,
         items,
         output_path,
-        max_retries=args.max_retries,
+        max_retries=args.retries,
+        parallelism=args.parallelism,
     )
 
 

@@ -50,8 +50,12 @@ python3 find-empty-bitbucket-projects.py \
 # Write the CSV to a specific path
 python3 find-empty-bitbucket-projects.py --output counts.csv
 
+# Searches to run in parallel (default 8); higher is faster but adds
+# load on the Sourcegraph instance
+python3 find-empty-bitbucket-projects.py --parallelism 16
+
 # Change the per-request retry budget (default 5; backoff 1s, 2s, 4s, ...)
-python3 find-empty-bitbucket-projects.py --max-retries 2
+python3 find-empty-bitbucket-projects.py --retries 2
 ```
 
 ## Output
