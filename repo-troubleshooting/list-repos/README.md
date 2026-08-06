@@ -94,15 +94,15 @@ python3 list-repos.py --reindex github.com/org/repo
 
 Possible output files:
 
-| File | When written |
-| --- | --- |
-| `<prefix>-repos.csv` | Every normal listing run |
-| `<prefix>-repos-with-cloning-errors.csv` | When one or more repos have a cloning or corruption error |
-| `<prefix>-repos-with-indexing-errors.csv` | When one or more cloned repos are missing a search index |
-| `<prefix>-repos-with-skipped-files.csv` | With `--skipped-files` and one or more skipped-file repos |
-| `<prefix>-stats-*.csv` | With `--statistics` |
-| `<prefix>-<repo>-<rev>-skipped-files.csv` | With `--skipped-files-reason REPO[@REV]` |
-| `<prefix>-<repo>-<rev>-skipped-stats.csv` | With `--skipped-files-reason REPO[@REV]` |
+| File                                      | When written                                              |
+| ----------------------------------------- | --------------------------------------------------------- |
+| `<prefix>-repos.csv`                      | Every normal listing run                                  |
+| `<prefix>-repos-with-cloning-errors.csv`  | When one or more repos have a cloning or corruption error |
+| `<prefix>-repos-with-indexing-errors.csv` | When one or more cloned repos are missing a search index  |
+| `<prefix>-repos-with-skipped-files.csv`   | With `--skipped-files` and one or more skipped-file repos |
+| `<prefix>-stats-*.csv`                    | With `--statistics`                                       |
+| `<prefix>-<repo>-<rev>-skipped-files.csv` | With `--skipped-files-reason REPO[@REV]`                  |
+| `<prefix>-<repo>-<rev>-skipped-stats.csv` | With `--skipped-files-reason REPO[@REV]`                  |
 
 - Optional columns from `--count-commits` and `--run-search` are appended to the
   per-repo CSVs
