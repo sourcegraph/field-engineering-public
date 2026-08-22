@@ -1,12 +1,13 @@
 # Field Engineering Public Repository
 
-This repository is a collection of independent tools and examples maintained by
-different people. Treat each tool directory as its own project. Do not install,
-build, lint, or test unrelated directories.
+- All public code must meet PUBLIC data classification requirements
+- This repository is a collection of independent tools and examples
+- Treat each tool directory as its own project
+- Do not install, build, lint, or test unrelated directories
 
 ## Working in an existing tool directory
 
-1. Read the nearest `AGENTS.md`, `README.md`, and package manifests.
+1. Read the nearest `AGENTS.md`, `README.md`, and package manifests
 2. If the directory has a `mise.toml`, run the following from that directory:
 
    ```bash
@@ -19,22 +20,22 @@ build, lint, or test unrelated directories.
    task installs only that project's dependencies. Use `mise tasks` to discover
    its check, test, and build tasks.
 3. If there is no `mise.toml`, do not fall back to a repository-wide install.
-   Documentation-only and standard-library scripts may need no setup. Add local
-   configuration only when the task genuinely requires it.
-4. Run checks from the project directory. Do not assume commands documented for
-   one sibling project apply to another.
+   Documentation-only and standard-library scripts may need no setup.
+   Add local configuration only when the task genuinely requires it.
+4. Run checks from the project directory.
+   Do not assume commands documented for one sibling project apply to another.
 
 `.agents/setup` intentionally installs only `mise`, the project-local tool
 dispatcher. It must not install a root toolchain or dependencies for every tool.
 
 ## Creating a new tool directory
 
-- Make the directory self-contained. Put its source, manifest, lockfile, tests,
-  and usage documentation together.
+- Make the directory self-contained.
+  Put its source, manifest, lockfile, tests, and usage documentation together.
 - Add a local `mise.toml` when the tool needs a language runtime, package manager,
   compiler, or external CLI. Pin compatible versions rather than using `latest`.
-- Define a `setup` task and the relevant `check`, `test`, or `build` tasks. Tasks
-  must be non-interactive and safe to rerun.
+- Define a `setup` task and the relevant `check`, `test`, or `build` tasks.
+  Tasks must be non-interactive and safe to rerun.
 - Commit dependency lockfiles. Do not commit virtual environments, downloaded
   dependencies, credentials, generated logs, or editor state.
 - Do not add tools to the repository root. A new tool must not make unrelated
@@ -80,3 +81,32 @@ run = "npm test"
   in APIs.
 - Use constructor injection and immutable dependencies in Spring applications.
 - Use the Pet Store API for public API examples: <https://petstore3.swagger.io>.
+
+## Build/Test Commands
+
+### TypeScript/JavaScript
+
+- Build: `npm run build` or `yarn build`
+- Test: `npm test` or `yarn test`
+- Single test: `npx jest <file-path>` or `jest -t "test name"`
+
+### Java/Kotlin
+
+- Build: `./gradlew build`
+- Test: `./gradlew test`
+- Single test: `./gradlew test --tests "<TestClassName>"`
+
+## Code Style Guidelines
+
+### TypeScript
+
+- Use strict type checking (`strict: true` in tsconfig.json)
+- Prefer ES modules and modern syntax
+- Use interfaces for defining types
+- Follow error handling conventions using HTTP status codes for APIs
+
+### Spring Framework
+
+- Use constructor injection instead of field injection with @Autowired
+- Make dependencies final to ensure immutability
+- Write testable components with explicit dependencies
