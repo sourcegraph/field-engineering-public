@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+local_binary_directory="$HOME/.local/bin"
+profile_marker="# field-engineering-public orb tools"
+
+timed_step() {
+  local description="$1"
+  shift
+  echo "==> $description"
+  time "$@"
+}
+
+mkdir -p "$local_binary_directory"
+export PATH="$local_binary_directory:$PATH"
+
+if ! command -v curl >/dev/null; then
+  echo "curl is required to install the repository toolchain" >&2
+  exit 1
+fi
+
+if ! command -v mise >/dev/null; then
+  timed_step "Installing mise" bash -c 'curl https://mise.run | sh'
+fi
+
+if ! command -v uv >/dev/null; then
+  timed_step "Installing uv" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+fi
+
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# field-engineering-public orb tools
+export PATH="$HOME/.local/bin:$PATH"
+if command -v mise >/dev/null; then
+  eval "$(mise activate bash)"
+fi
+EOF
+fi
+
+eval "$(mise activate bash)"
+mise trust "$repository_root/.mise.toml"
+mise trust "$repository_root/bootstrap-instance/mise.toml"
+
+timed_step "Installing the root toolchain" mise install --cd "$repository_root"
+timed_step "Installing the bootstrap toolchain" mise install --cd "$repository_root/bootstrap-instance"
+
+for project in bootstrap-instance entitlement-sync repo-troubleshooting/list-repos; do
+  timed_step "Syncing $project" uv sync --frozen --project "$repository_root/$project"
+done
+
+echo "Orb setup complete."
