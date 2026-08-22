@@ -4,6 +4,5 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 command -v mise >/dev/null
-command -v uv >/dev/null
 
-echo "Orb tools are ready."
+echo "Orb tool manager is ready."
