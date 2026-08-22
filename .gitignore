@@ -1,12 +1,15 @@
 __pycache__
 .DS_Store
-.env*
 .idea
 .ruff_cache
 .src_users_backup.json
 .venv
 .vscode
+*.csv
 *.egg-info/
+*.env*
 *.log
+*runs/
 bin/
+notes/
 schema.gql
