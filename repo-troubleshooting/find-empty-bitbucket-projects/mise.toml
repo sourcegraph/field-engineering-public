@@ -1,0 +1,10 @@
+[tools]
+python = "3.10"
+
+[tasks.setup]
+description = "Verify the Python runtime; this script has no third-party dependencies"
+run = "python --version"
+
+[tasks.check]
+description = "Check that the script compiles"
+run = "python -m py_compile find-empty-bitbucket-projects.py"

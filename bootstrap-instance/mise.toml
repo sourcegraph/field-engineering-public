@@ -1,3 +1,11 @@
 [tools]
-python = "latest"
-uv = "latest"
+python = "3.13"
+uv = "0.12.5"
+
+[tasks.setup]
+description = "Install locked Python dependencies"
+run = "uv sync --frozen"
+
+[tasks.check]
+description = "Check that the script compiles"
+run = "uv run python -m py_compile bootstrap-instance.py"

@@ -1,0 +1,11 @@
+[tools]
+python = "3.13"
+uv = "0.12.5"
+
+[tasks.setup]
+description = "Create a virtual environment and install dependencies"
+run = "uv venv --python python --allow-existing && uv pip sync requirements.lock"
+
+[tasks.check]
+description = "Check that the script compiles"
+run = "uv run python -m py_compile organization-management.py"
