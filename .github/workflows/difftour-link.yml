@@ -1,0 +1,53 @@
+name: Diff Tour link
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write # needed to create/update comments
+
+jobs:
+  post-link:
+    runs-on: ubuntu-latest
+    # DiffTour resolves branch names against this repository, so the head
+    # branch must live on this repo (skip fork PRs).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const instance = 'https://sourcegraph.sourcegraph.com';
+            const repo = `github.com/${context.payload.repository.full_name}`;
+            const base = context.payload.pull_request.base.ref;
+            const head = context.payload.pull_request.head.ref;
+
+            const range = `${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+            const url = `${instance}/r/${repo}/-/compare/${range}?mode=Tour`;
+
+            const marker = '<!-- difftour-link -->';
+            const body = `${marker}\n[Open the Diff Tour for this PR in Sourcegraph](${url})`;
+
+            // Find an existing comment we posted before (sticky comment).
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
