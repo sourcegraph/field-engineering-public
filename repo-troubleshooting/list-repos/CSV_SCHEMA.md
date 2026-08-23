@@ -12,21 +12,34 @@ contains `field not in v<Sourcegraph version>`
 
 ## Output files
 
-The script prefixes output file names with the sanitized Sourcegraph endpoint
-(e.g. `sourcegraph.example.com-repos.csv`),
-so the script can run against multiple instances without overwriting files
+Each run writes outputs under
+`list-repos-runs/<sanitized-endpoint>/<timestamp>/`, so runs cannot
+overwrite each other. Files are created lazily and are absent when they have
+no rows
 
 | File | Written when | Columns |
 | --- | --- | --- |
-| `<prefix>-repos.csv` | always | main columns |
-| `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
-| `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
-| `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
-| `<prefix>-skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns |
-| `<prefix>-stats-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
+| `repos.csv` | at least one repo row is written | main columns |
+| `repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
+| `repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
+| `skipped-files-reason-details.csv` | `--skipped-files-reason` finds at least one detail row | skipped-file reason columns |
+| `skipped-files-reason-stats.csv` | targeted `--skipped-files-reason REPO[@REV]` finds at least one reason | `reason,count` |
+| `stats-*.csv` | `--stats` is set and repos were processed | `bucket,count` (see Stats section) |
+
+Row-bearing CSV files are sorted after writing with a bounded-memory external
+sort
+
+| File | Sort columns |
+| --- | --- |
+| `repos.csv` | `url` |
+| `repos-with-cloning-errors.csv` | `url` |
+| `repos-with-indexing-errors.csv` | `url` |
+| `repos-with-skipped-files.csv` | `url` |
+| `skipped-files-reason-details.csv` | `repository.name`, `rev`, `reason`, `file.extension`, `file.path` |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to the repo-listing CSVs above, excluding the `--statistics`
+columns to the repo-listing CSVs above, excluding the `--stats`
 files and the skipped-file reason detail CSV, in this order: main
 columns → per-CSV extras → commit-count columns → run-search columns
 
@@ -68,7 +81,7 @@ These are written to every repo-listing CSV file
 
 ## Cloning-error extras
 
-Appended to `<prefix>-repos-with-cloning-errors.csv`
+Appended to `repos-with-cloning-errors.csv`
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -79,7 +92,7 @@ Appended to `<prefix>-repos-with-cloning-errors.csv`
 
 ## Skipped-files extras
 
-Appended to `<prefix>-repos-with-skipped-files.csv`
+Appended to `repos-with-skipped-files.csv`
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -89,18 +102,19 @@ Appended to `<prefix>-repos-with-skipped-files.csv`
 
 ## Skipped-file reason columns
 
-Written to `<prefix>-skipped-file-reasons.csv` when
-`--skipped-files-reason` is used without `REPO[@REV]`
+Written to `skipped-files-reason-details.csv` when
+`--skipped-files-reason` finds detail rows
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
 | `repository.name` | string | | Sourcegraph repository name containing the skipped file |
-| `rev` | string | | Indexed revision parsed from Sourcegraph's skippedIndexed.query |
-| `reason` | string | | NOT-INDEXED reason parsed from the indexed placeholder content |
+| `rev` | string | | Indexed ref containing the skipped file |
+| `reason` | string | | Compact NOT-INDEXED reason parsed from the indexed placeholder content |
 | `file.extension` | string | | File extension derived from file.path |
 | `file.byteSize` | integer | | Sourcegraph-reported file byte size |
-| `skippedIndexed.count` | integer | | Count Sourcegraph reported for this repo/ref before running the details search |
-| `file.path` | string | | Path of the skipped file within the repository |
+| `file.distinctTrigramCount` | integer | | Distinct three-character trigrams computed from GitBlob.content. Only populated with --skipped-file-metrics for files skipped because they contain too many trigrams |
+| `repoRevSkippedIndexed.count` | integer | | Skipped-file count Sourcegraph reported for this repository ref |
+| `file.path` | string | | Path of the skipped file inside the repository |
 | `file_url` | string | | Sourcegraph blob URL for the skipped file at the indexed ref |
 
 ## `--count-commits` columns
@@ -130,15 +144,15 @@ Appended to CSV files when `--run-search PATTERN` is used
 | `runSearch.limitHit` | boolean | | `True` when the search hit a limit, so the results are incomplete |
 | `runSearch.alertTitle` | string | | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed |
 
-## `--statistics` files
+## `--stats` files
 
-- Written when `--statistics` is used
+- Written when `--stats` is used
 - One CSV file per dimension
 - Each file has two columns listing every bucket in declaration
 order, followed by per-stat summary rows (totals) appended below the
 bucket rows
 - Counts come from the same listing pass that produces the
-main CSV, so enabling `--statistics` adds no extra GraphQL requests
+main CSV, so enabling `--stats` adds no extra GraphQL requests
 
 | File suffix | Buckets | Description |
 | --- | --- | --- |

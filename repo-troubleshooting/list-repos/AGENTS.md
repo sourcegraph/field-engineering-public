@@ -36,6 +36,7 @@
   - Do not bother with prepending function names wih `_`
 - Use only standard libraries, do not require customers to install additional
   packages
+- Keep behavior portable across macOS, Linux, and Windows
 - Keep the minimum required versions of Python and Sourcegraph up to date in
   the README.md file
 - Use `uv` when needed, ex. to run pyright
