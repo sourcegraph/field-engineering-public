@@ -69,100 +69,259 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
 
 # --- GraphQL queries ----------------------------------------------------------
 
-# Shared fields for full-listing and single-repo queries. The text-search
-# index failure fields are added only when schema introspection confirms the
-# target Sourcegraph instance supports them; @include cannot hide unknown fields
-# from GraphQL validation on older instances.
-REPO_NODE_FRAGMENT_HEAD = """
-fragment RepoNodeFields on Repository {
-  name
-  id
-  url
-  isFork
-  isArchived
-  isPrivate
-  createdAt
-  mirrorInfo {
-    remoteURL
-    cloned
-    cloneInProgress
-    isCorrupted
-    lastError
-    lastSyncOutput
-    corruptionLogs {
-      timestamp
-      reason
-    }
-    byteSize
-    lastChanged
-    updatedAt
-    nextSyncAt
-    updateSchedule {
-      intervalSeconds
-    }
-    shard
+SOURCEGRAPH_VERSION_QUERY = """
+query SourcegraphVersion {
+  site {
+    productVersion
   }
-  textSearchIndex {
-    status {
-      updatedAt
-      contentFilesCount
-      contentByteSize
-      indexByteSize
-      indexShardsCount
-      newLinesCount
-      defaultBranchNewLinesCount
-      otherBranchesNewLinesCount
-    }
+}
 """
 
-REPO_NODE_TEXT_SEARCH_INDEX_FAILURE_FIELDS = """
-    lastIndexStatus
-    lastIndexFailureMessage
-"""
-
-REPO_NODE_FRAGMENT_TAIL = """
-    host {
+GRAPHQL_SCHEMA_QUERY = """
+query ListReposSchema {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    types {
       name
-    }
-    refs {
-      ref {
-        displayName
+      fields(includeDeprecated: true) {
+        name
+        args { name }
+        type {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+              ofType {
+                kind
+                name
+              }
+            }
+          }
+        }
       }
-      skippedIndexed {
-        count
-        query
-      }
-    }
-  }
-  externalServices(first: 100) @include(if: $includeExternalServices) {
-    nodes {
-      displayName
     }
   }
 }
 """
 
+# Every repository field used by the listing pipeline. Startup introspection
+# removes unavailable fields before GraphQL validates the query.
+REPOSITORY_SELECTION: dict[str, Any] = {
+    "name": None,
+    "id": None,
+    "url": None,
+    "isFork": None,
+    "isArchived": None,
+    "isPrivate": None,
+    "createdAt": None,
+    "mirrorInfo": {
+        "remoteURL": None,
+        "cloned": None,
+        "cloneInProgress": None,
+        "isCorrupted": None,
+        "lastError": None,
+        "lastSyncOutput": None,
+        "corruptionLogs": {"timestamp": None, "reason": None},
+        "byteSize": None,
+        "lastChanged": None,
+        "updatedAt": None,
+        "nextSyncAt": None,
+        "updateSchedule": {"intervalSeconds": None},
+        "shard": None,
+    },
+    "textSearchIndex": {
+        "status": {
+            "updatedAt": None,
+            "contentFilesCount": None,
+            "contentByteSize": None,
+            "indexByteSize": None,
+            "indexShardsCount": None,
+            "newLinesCount": None,
+            "defaultBranchNewLinesCount": None,
+            "otherBranchesNewLinesCount": None,
+        },
+        "lastIndexStatus": None,
+        "lastIndexFailureMessage": None,
+        "host": {"name": None},
+        "refs": {
+            "ref": {"displayName": None},
+            "skippedIndexed": {"count": None, "query": None},
+        },
+    },
+    "externalServices": {"nodes": {"displayName": None}},
+}
 
-def build_repo_node_fragment(include_index_failure_fields: bool) -> str:
-    """Return the shared Repository fragment with optional index-failure fields"""
-    return (
-        REPO_NODE_FRAGMENT_HEAD
-        + (
-            REPO_NODE_TEXT_SEARCH_INDEX_FAILURE_FIELDS
-            if include_index_failure_fields
-            else ""
-        )
-        + REPO_NODE_FRAGMENT_TAIL
+
+@dataclass(frozen=True)
+class GraphQLSchema:
+    """GraphQL object fields and their unwrapped return type names"""
+
+    query_type: str
+    mutation_type: str | None
+    field_types: dict[str, dict[str, str]]
+    field_arguments: dict[str, dict[str, frozenset[str]]]
+
+    def field_type(self, type_name: str, field_name: str) -> str | None:
+        """Return the named return type for one field"""
+        return self.field_types.get(type_name, {}).get(field_name)
+
+    def has_path(self, type_name: str, path: tuple[str, ...]) -> bool:
+        """Return whether every field in path exists from type_name"""
+        current_type = type_name
+        for field_name in path:
+            next_type = self.field_type(current_type, field_name)
+            if next_type is None:
+                return False
+            current_type = next_type
+        return True
+
+
+def named_graphql_type(raw_type: object) -> str | None:
+    """Unwrap NON_NULL/LIST introspection data to its named type"""
+    current = raw_type
+    while isinstance(current, dict):
+        current_dict = cast("dict[str, object]", current)
+        name = current_dict.get("name")
+        if isinstance(name, str) and name:
+            return name
+        current = current_dict.get("ofType")
+    return None
+
+
+def parse_graphql_schema(data: dict[str, Any]) -> GraphQLSchema:
+    """Build the small schema index needed to shape queries"""
+    raw_schema: dict[str, Any] = data.get("__schema") or {}
+    raw_query_type: dict[str, Any] = raw_schema.get("queryType") or {}
+    query_type = raw_query_type.get("name")
+    if not isinstance(query_type, str) or not query_type:
+        msg = "GraphQL introspection did not return a query type"
+        raise GraphQLError(msg)
+    raw_mutation_type: dict[str, Any] = raw_schema.get("mutationType") or {}
+    mutation_type_value = raw_mutation_type.get("name")
+    mutation_type = (
+        mutation_type_value
+        if isinstance(mutation_type_value, str) and mutation_type_value
+        else None
+    )
+    field_types: dict[str, dict[str, str]] = {}
+    field_arguments: dict[str, dict[str, frozenset[str]]] = {}
+    for raw_type in raw_schema.get("types") or []:
+        if not isinstance(raw_type, dict):
+            continue
+        type_name = raw_type.get("name")
+        if not isinstance(type_name, str) or not type_name:
+            continue
+        type_fields: dict[str, str] = {}
+        type_arguments: dict[str, frozenset[str]] = {}
+        for raw_field in raw_type.get("fields") or []:
+            if not isinstance(raw_field, dict):
+                continue
+            field_name = raw_field.get("name")
+            return_type = named_graphql_type(raw_field.get("type"))
+            if not isinstance(field_name, str) or return_type is None:
+                continue
+            type_fields[field_name] = return_type
+            type_arguments[field_name] = frozenset(
+                argument_name
+                for argument in raw_field.get("args") or []
+                if isinstance(argument, dict)
+                and isinstance(argument_name := argument.get("name"), str)
+            )
+        field_types[type_name] = type_fields
+        field_arguments[type_name] = type_arguments
+    return GraphQLSchema(
+        query_type=query_type,
+        mutation_type=mutation_type,
+        field_types=field_types,
+        field_arguments=field_arguments,
     )
 
 
-# Non-admin tokens set $includeExternalServices=false to skip admin-only fields
-def build_repository_listing_query(include_index_failure_fields: bool) -> str:
-    """Return the paginated repository listing query"""
+def build_supported_selection(
+    schema: GraphQLSchema,
+    type_name: str,
+    selection: dict[str, Any],
+    *,
+    indent: int,
+    field_arguments: dict[str, str] | None = None,
+) -> str:
+    """Render only selection fields present in schema"""
+    lines: list[str] = []
+    for field_name, child_selection in selection.items():
+        child_type = schema.field_type(type_name, field_name)
+        if child_type is None:
+            continue
+        arguments = (field_arguments or {}).get(field_name, "")
+        if field_name == "externalServices" and "first" in schema.field_arguments.get(
+            type_name,
+            {},
+        ).get(field_name, frozenset()):
+            arguments = "(first: 100)"
+        prefix = " " * indent + field_name + arguments
+        if child_selection is None:
+            lines.append(prefix)
+            continue
+        rendered_children = build_supported_selection(
+            schema,
+            child_type,
+            child_selection,
+            indent=indent + 2,
+            field_arguments=field_arguments,
+        )
+        if rendered_children:
+            lines.extend((prefix + " {", rendered_children, " " * indent + "}"))
+    return "\n".join(lines)
+
+
+def repository_type_name(schema: GraphQLSchema) -> str:
+    """Return Repository's actual type name through Query.repositories"""
+    connection_type = schema.field_type(schema.query_type, "repositories")
+    repository_type = (
+        schema.field_type(connection_type, "nodes") if connection_type else None
+    )
+    if repository_type is None:
+        msg = "GraphQL schema does not expose Query.repositories.nodes"
+        raise GraphQLError(msg)
+    return repository_type
+
+
+def build_repo_node_fragment(
+    schema: GraphQLSchema,
+    *,
+    can_read_protected_fields: bool,
+) -> str:
+    """Return the shared Repository fragment supported by this instance"""
+    repository_type = repository_type_name(schema)
+    selection = dict(REPOSITORY_SELECTION)
+    if not can_read_protected_fields:
+        selection.pop("externalServices")
+    rendered = build_supported_selection(
+        schema,
+        repository_type,
+        selection,
+        indent=2,
+    )
+    return f"fragment RepoNodeFields on {repository_type} {{\n{rendered}\n}}\n"
+
+
+def build_repository_listing_query(
+    schema: GraphQLSchema,
+    *,
+    can_read_protected_fields: bool,
+) -> str:
+    """Return a paginated query containing only supported repository fields"""
     return (
-        build_repo_node_fragment(include_index_failure_fields)
+        build_repo_node_fragment(
+            schema,
+            can_read_protected_fields=can_read_protected_fields,
+        )
         + """
-query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!) {
+query ListRepos($first: Int!, $after: String) {
   repositories(first: $first, after: $after) {
     nodes {
       ...RepoNodeFields
@@ -182,12 +341,19 @@ query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!
 # / --reindex. Returns the same field set as the listing query (via the shared
 # fragment) so the rest of the pipeline (build_row, write_csv, the error/skip
 # detectors, etc.) can treat the result identically to a listing-page node
-def build_single_repo_query(include_index_failure_fields: bool) -> str:
-    """Return the single repository lookup query"""
+def build_single_repo_query(
+    schema: GraphQLSchema,
+    *,
+    can_read_protected_fields: bool,
+) -> str:
+    """Return a supported single-repository lookup query"""
     return (
-        build_repo_node_fragment(include_index_failure_fields)
+        build_repo_node_fragment(
+            schema,
+            can_read_protected_fields=can_read_protected_fields,
+        )
         + """
-query SingleRepo($name: String!, $includeExternalServices: Boolean!) {
+query SingleRepo($name: String!) {
   repository(name: $name) {
     ...RepoNodeFields
   }
@@ -196,51 +362,55 @@ query SingleRepo($name: String!, $includeExternalServices: Boolean!) {
     )
 
 
-# Used once at startup to gate admin-only fields and mutations
+# Used once at startup to gate protected fields and site-admin mutations
 CURRENT_USER_QUERY = """
-query { currentUser { username siteAdmin } }
-"""
-
-TEXT_SEARCH_INDEX_FIELDS_QUERY = """
-query TextSearchIndexFields {
-  __type(name: "RepositoryTextSearchIndex") {
-    fields {
-      name
+query CurrentUserPermissions {
+  currentUser {
+    username
+    siteAdmin
+    permissions {
+      nodes {
+        namespace
+        action
+      }
     }
   }
 }
 """
 
-TEXT_SEARCH_INDEX_FAILURE_FIELD_NAMES = frozenset(
-    {"lastIndexStatus", "lastIndexFailureMessage"},
-)
+REPOSITORY_MANAGEMENT_PERMISSION_NAMESPACE = "REPO_MANAGEMENT"
+READ_PERMISSION_ACTION = "READ"
 
-# Per-repo query for exact rev count, cleanup metadata, and all-refs proxy
-# Omitting ancestors.first asks gitserver for the full reachable commit count
-COMMIT_COUNT_QUERY = """
+# Per-repo query for exact rev count, cleanup metadata, and all-refs proxy.
+# Omitting ancestors.first asks gitserver for the full reachable commit count.
+COMMIT_COUNT_REPOSITORY_SELECTION: dict[str, Any] = {
+    "commit": {"ancestors": {"totalCount": None}},
+    "mirrorInfo": {
+        "lastCleanedAt": None,
+        "cleanupSchedule": {"due": None, "intervalSeconds": None},
+        "cleanupQueue": {"index": None, "optimizing": None},
+        "repositoryStatistics": {"packfiles": {"lastFullRepack": None}},
+    },
+}
+
+
+def build_commit_count_query(schema: GraphQLSchema) -> str:
+    """Return a commit-count query without unsupported repository fields"""
+    repository_type = repository_type_name(schema)
+    repository_selection = build_supported_selection(
+        schema,
+        repository_type,
+        COMMIT_COUNT_REPOSITORY_SELECTION,
+        indent=4,
+        field_arguments={"commit": "(rev: $rev)"},
+    )
+    return (
+        """
 query CommitCount($name: String!, $rev: String!, $allRefsSearch: String!) {
   repository(name: $name) {
-    commit(rev: $rev) {
-      ancestors {
-        totalCount
-      }
-    }
-    mirrorInfo {
-      lastCleanedAt
-      cleanupSchedule {
-        due
-        intervalSeconds
-      }
-      cleanupQueue {
-        index
-        optimizing
-      }
-      repositoryStatistics {
-        packfiles {
-          lastFullRepack
-        }
-      }
-    }
+"""
+        + repository_selection
+        + """
   }
   search(query: $allRefsSearch, version: V3) {
     results {
@@ -249,6 +419,8 @@ query CommitCount($name: String!, $rev: String!, $allRefsSearch: String!) {
   }
 }
 """
+    )
+
 
 # Approximate all-refs count. Not comparable to the exact rev count
 # Repo anchoring, regex escaping, and timeout prevent slow unbounded searches
@@ -582,16 +754,23 @@ def fetch_commit_count(
     token: str,
     repo_name: str,
     rev: str = "HEAD",
+    *,
+    schema: GraphQLSchema,
+    unavailable_values: dict[str, str],
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[int | None, int | None, float, list[Any]]:
     """Return exact rev count, approximate all-refs count, elapsed time, extras"""
-    empty_extras: list[Any] = [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
+    empty_extras = extract_csv_values(
+        {},
+        COMMIT_COUNT_OPTIMIZATION_COLUMNS,
+        unavailable_values,
+    )
     start = time.monotonic()
     try:
         data = graphql_request(
             endpoint,
             token,
-            COMMIT_COUNT_QUERY,
+            build_commit_count_query(schema),
             {
                 "name": repo_name,
                 "rev": rev,
@@ -627,9 +806,11 @@ def fetch_commit_count(
     all_refs_count: int | None = (
         all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
     )
-    optimization_values = [
-        extract(repo) for _, extract, _, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
-    ]
+    optimization_values = extract_csv_values(
+        repo,
+        COMMIT_COUNT_OPTIMIZATION_COLUMNS,
+        unavailable_values,
+    )
     return default_count, all_refs_count, elapsed, optimization_values
 
 
@@ -821,8 +1002,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "textSearchIndex.lastIndexStatus",
         lambda r: get_path(r, "textSearchIndex.lastIndexStatus"),
         "Most recent persisted text search indexing attempt result. "
-        "Blank when the Sourcegraph instance does not expose this field "
-        "or no attempt was reported",
+        "Blank when no attempt was reported",
         False,
         "enum (SUCCESS, FAILURE)",
     ),
@@ -830,8 +1010,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "textSearchIndex.lastIndexFailureMessage",
         lambda r: get_path(r, "textSearchIndex.lastIndexFailureMessage"),
         "Failure message from the most recent persisted text search indexing "
-        "attempt. Blank when the Sourcegraph instance does not expose this "
-        "field or no failure was reported",
+        "attempt. Blank when no failure was reported",
         False,
         "string",
     ),
@@ -1088,6 +1267,130 @@ SKIPPED_FILES_EXTRA_COLUMNS: list[
 SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
     name for name, _, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
 ]
+
+# Source schema paths needed to produce each listing-derived CSV column.
+# Locally derived columns list every field required for a trustworthy value.
+CSV_COLUMN_SCHEMA_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "id": (("id",),),
+    "url": (("url",),),
+    "mirrorInfo.remoteURL": (("mirrorInfo", "remoteURL"),),
+    "externalServices": (("externalServices", "nodes", "displayName"),),
+    "mirrorInfo.status": (
+        ("mirrorInfo", "isCorrupted"),
+        ("mirrorInfo", "lastError"),
+        ("mirrorInfo", "cloneInProgress"),
+        ("mirrorInfo", "cloned"),
+    ),
+    "isFork": (("isFork",),),
+    "isArchived": (("isArchived",),),
+    "isPrivate": (("isPrivate",),),
+    "mirrorInfo.byteSize(MB)": (("mirrorInfo", "byteSize"),),
+    "createdAt": (("createdAt",),),
+    "mirrorInfo.lastChanged": (("mirrorInfo", "lastChanged"),),
+    "mirrorInfo.updatedAt": (("mirrorInfo", "updatedAt"),),
+    "mirrorInfo.secondsSinceUpdatedAt": (("mirrorInfo", "updatedAt"),),
+    "mirrorInfo.nextSyncAt": (("mirrorInfo", "nextSyncAt"),),
+    "mirrorInfo.secondsUntilNextSyncAt": (("mirrorInfo", "nextSyncAt"),),
+    "mirrorInfo.updateSchedule.intervalSeconds": (
+        ("mirrorInfo", "updateSchedule", "intervalSeconds"),
+    ),
+    "mirrorInfo.shard": (("mirrorInfo", "shard"),),
+    "textSearchIndex.status": (("textSearchIndex", "status", "updatedAt"),),
+    "textSearchIndex.lastIndexStatus": (("textSearchIndex", "lastIndexStatus"),),
+    "textSearchIndex.lastIndexFailureMessage": (
+        ("textSearchIndex", "lastIndexFailureMessage"),
+    ),
+    "textSearchIndex.status.updatedAt": (("textSearchIndex", "status", "updatedAt"),),
+    "textSearchIndex.status.contentFilesCount": (
+        ("textSearchIndex", "status", "contentFilesCount"),
+    ),
+    "textSearchIndex.status.contentByteSize(MB)": (
+        ("textSearchIndex", "status", "contentByteSize"),
+    ),
+    "textSearchIndex.status.indexByteSize(MB)": (
+        ("textSearchIndex", "status", "indexByteSize"),
+    ),
+    "textSearchIndex.status.indexShardsCount": (
+        ("textSearchIndex", "status", "indexShardsCount"),
+    ),
+    "textSearchIndex.status.newLinesCount": (
+        ("textSearchIndex", "status", "newLinesCount"),
+    ),
+    "textSearchIndex.status.defaultBranchNewLinesCount": (
+        ("textSearchIndex", "status", "defaultBranchNewLinesCount"),
+    ),
+    "textSearchIndex.status.otherBranchesNewLinesCount": (
+        ("textSearchIndex", "status", "otherBranchesNewLinesCount"),
+    ),
+    "textSearchIndex.host.name": (("textSearchIndex", "host", "name"),),
+    "mirrorInfo.isCorrupted": (("mirrorInfo", "isCorrupted"),),
+    "mirrorInfo.lastError": (("mirrorInfo", "lastError"),),
+    "mirrorInfo.lastSyncOutput": (("mirrorInfo", "lastSyncOutput"),),
+    "mirrorInfo.corruptionLogs": (
+        ("mirrorInfo", "corruptionLogs", "timestamp"),
+        ("mirrorInfo", "corruptionLogs", "reason"),
+    ),
+    "mirrorInfo.lastCleanedAt": (("mirrorInfo", "lastCleanedAt"),),
+    "mirrorInfo.cleanupSchedule.due": (("mirrorInfo", "cleanupSchedule", "due"),),
+    "mirrorInfo.cleanupSchedule.intervalSeconds": (
+        ("mirrorInfo", "cleanupSchedule", "intervalSeconds"),
+    ),
+    "mirrorInfo.cleanupQueue.index": (("mirrorInfo", "cleanupQueue", "index"),),
+    "mirrorInfo.cleanupQueue.optimizing": (
+        ("mirrorInfo", "cleanupQueue", "optimizing"),
+    ),
+    "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack": (
+        (
+            "mirrorInfo",
+            "repositoryStatistics",
+            "packfiles",
+            "lastFullRepack",
+        ),
+    ),
+    "skippedIndexed.totalCount": (
+        ("textSearchIndex", "refs", "skippedIndexed", "count"),
+    ),
+    "skippedIndexed.refsWithSkips": (
+        ("textSearchIndex", "refs", "ref", "displayName"),
+        ("textSearchIndex", "refs", "skippedIndexed", "count"),
+    ),
+    "skippedIndexed.headQuery": (
+        ("textSearchIndex", "refs", "ref", "displayName"),
+        ("textSearchIndex", "refs", "skippedIndexed", "count"),
+        ("textSearchIndex", "refs", "skippedIndexed", "query"),
+    ),
+}
+
+
+def unavailable_csv_column_values(
+    schema: GraphQLSchema,
+    sourcegraph_version: str,
+) -> dict[str, str]:
+    """Return version markers for columns unsupported by the target schema"""
+    repository_type = repository_type_name(schema)
+    marker = f"field not in v{sourcegraph_version}"
+    return {
+        column_name: marker
+        for column_name, required_paths in CSV_COLUMN_SCHEMA_PATHS.items()
+        if not all(schema.has_path(repository_type, path) for path in required_paths)
+    }
+
+
+def admin_required_csv_column_values() -> dict[str, str]:
+    """Return markers for columns unavailable to non-admin users"""
+    column_groups = (
+        COLUMNS,
+        COMMIT_COUNT_OPTIMIZATION_COLUMNS,
+        CLONING_ERROR_EXTRA_COLUMNS,
+        SKIPPED_FILES_EXTRA_COLUMNS,
+    )
+    return {
+        column_name: "requires admin"
+        for columns in column_groups
+        for column_name, _, _, requires_admin, _ in columns
+        if requires_admin
+    }
+
 
 SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
     (
@@ -1395,11 +1698,12 @@ def write_csv_schema(path: Path) -> None:
 - This file is generated by `python3 list-repos.py --write-csv-schema`
 - It documents every column in each of its CSV output files
 - Columns where `Requires admin` is `true` are from GraphQL fields
-which require an access token from a site admin user on the instance
-  - When you run the script with an access token from a non-admin user,
-    these columns will be empty
+which require a site admin or the `REPO_MANAGEMENT#READ` permission
+  - Without either authorization, these columns contain `requires admin`
 - Every other column is populated for any authenticated user with read access
 to the repository
+- If the instance's GraphQL schema does not contain a field, its CSV column
+contains `field not in v<Sourcegraph version>`
 
 ## Output files
 
@@ -1752,8 +2056,8 @@ def fetch_current_user(
     endpoint: str,
     token: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> tuple[str, bool]:
-    """Return the authenticated username and site-admin flag"""
+) -> tuple[str, bool, bool]:
+    """Return username, site-admin status, and protected-field read access"""
     data = graphql_request(
         endpoint,
         token,
@@ -1763,63 +2067,54 @@ def fetch_current_user(
         request_description="Current user query",
     )
     user: dict[str, Any] = data["currentUser"] or {}
-    return str(user["username"]), bool(user.get("siteAdmin"))
+    is_site_admin = bool(user.get("siteAdmin"))
+    permissions: dict[str, Any] = user.get("permissions") or {}
+    permission_nodes: list[dict[str, Any]] = permissions.get("nodes") or []
+    can_read_protected_fields = is_site_admin or any(
+        permission.get("namespace") == REPOSITORY_MANAGEMENT_PERMISSION_NAMESPACE
+        and permission.get("action") == READ_PERMISSION_ACTION
+        for permission in permission_nodes
+    )
+    return str(user["username"]), is_site_admin, can_read_protected_fields
 
 
-def fetch_text_search_index_field_names(
+def fetch_sourcegraph_version(
     endpoint: str,
     token: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> set[str]:
-    """Return fields exposed by RepositoryTextSearchIndex in the target schema"""
+) -> str:
+    """Return site.productVersion from the target Sourcegraph instance"""
     data = graphql_request(
         endpoint,
         token,
-        TEXT_SEARCH_INDEX_FIELDS_QUERY,
+        SOURCEGRAPH_VERSION_QUERY,
         {},
         max_retries=max_retries,
-        request_description="RepositoryTextSearchIndex schema query",
+        request_description="Sourcegraph version query",
     )
-    type_info: dict[str, Any] = data.get("__type") or {}
-    raw_fields: list[dict[str, Any]] = type_info.get("fields") or []
-    return {
-        name
-        for field in raw_fields
-        if isinstance(name := field.get("name"), str) and name
-    }
+    site: dict[str, Any] = data.get("site") or {}
+    version = site.get("productVersion")
+    if not isinstance(version, str) or not version:
+        msg = "Sourcegraph version query did not return site.productVersion"
+        raise GraphQLError(msg)
+    return version
 
 
-def supports_text_search_index_failure_fields(
+def fetch_graphql_schema(
     endpoint: str,
     token: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> bool:
-    """Return True when it is safe to query text-search index failure fields"""
-    try:
-        field_names = fetch_text_search_index_field_names(
-            endpoint,
-            token,
-            max_retries=max_retries,
-        )
-    except (GraphQLError, HTTPRequestError, OSError) as error:
-        logger.warning(
-            "Could not inspect Sourcegraph schema for new text-search index "
-            "failure fields (requires v7.5.0); leaving those CSV columns blank: %s",
-            error,
-        )
-        return False
-
-    missing = sorted(TEXT_SEARCH_INDEX_FAILURE_FIELD_NAMES - field_names)
-    if missing:
-        logger.info(
-            "Sourcegraph schema does not expose new text-search index "
-            "failure fields (requires v7.5.0); leaving those CSV columns blank: %s",
-            ", ".join(missing),
-        )
-        return False
-
-    logger.info("Including text-search index failure fields in repository queries")
-    return True
+) -> GraphQLSchema:
+    """Fetch and index the target instance's GraphQL schema"""
+    data = graphql_request(
+        endpoint,
+        token,
+        GRAPHQL_SCHEMA_QUERY,
+        {},
+        max_retries=max_retries,
+        request_description="GraphQL schema query",
+    )
+    return parse_graphql_schema(data)
 
 
 def fetch_single_repo(
@@ -1827,16 +2122,19 @@ def fetch_single_repo(
     token: str,
     repo_name: str,
     *,
-    is_site_admin: bool,
-    include_index_failure_fields: bool,
+    can_read_protected_fields: bool,
+    schema: GraphQLSchema,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
-    """Fetch one repo node in listing-query shape, respecting admin-only fields"""
+    """Fetch one repo node in listing-query shape, respecting protected fields"""
     data = graphql_request(
         endpoint,
         token,
-        build_single_repo_query(include_index_failure_fields),
-        {"name": repo_name, "includeExternalServices": is_site_admin},
+        build_single_repo_query(
+            schema,
+            can_read_protected_fields=can_read_protected_fields,
+        ),
+        {"name": repo_name},
         max_retries=max_retries,
         request_description=f"Repository metadata for {repo_name}",
     )
@@ -2329,8 +2627,8 @@ def fetch_repository_page(
     cursor: str | None,
     request_page_size: int,
     *,
-    is_site_admin: bool,
-    include_index_failure_fields: bool,
+    can_read_protected_fields: bool,
+    schema: GraphQLSchema,
     max_retries: int,
 ) -> RepositoryPage:
     """Fetch one repository listing page, reducing page size on field-count errors"""
@@ -2340,11 +2638,13 @@ def fetch_repository_page(
             data = graphql_request(
                 endpoint,
                 token,
-                build_repository_listing_query(include_index_failure_fields),
+                build_repository_listing_query(
+                    schema,
+                    can_read_protected_fields=can_read_protected_fields,
+                ),
                 {
                     "first": request_page_size,
                     "after": cursor,
-                    "includeExternalServices": is_site_admin,
                 },
                 max_retries=max_retries,
                 request_description=(
@@ -2387,8 +2687,8 @@ def fetch_repos(
     *,
     page_size: int = PAGE_SIZE,
     scope_repo: str | None = None,
-    is_site_admin: bool,
-    include_index_failure_fields: bool,
+    can_read_protected_fields: bool,
+    schema: GraphQLSchema,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples for a scoped repo or paged repo list"""
@@ -2397,8 +2697,8 @@ def fetch_repos(
             endpoint,
             token,
             scope_repo,
-            is_site_admin=is_site_admin,
-            include_index_failure_fields=include_index_failure_fields,
+            can_read_protected_fields=can_read_protected_fields,
+            schema=schema,
             max_retries=max_retries,
         )
         logger.info("Scope: single repository %s", scope_repo)
@@ -2425,8 +2725,8 @@ def fetch_repos(
         token,
         None,
         request_page_size,
-        is_site_admin=is_site_admin,
-        include_index_failure_fields=include_index_failure_fields,
+        can_read_protected_fields=can_read_protected_fields,
+        schema=schema,
         max_retries=max_retries,
     )
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as page_executor:
@@ -2462,8 +2762,8 @@ def fetch_repos(
                         token,
                         page_info["endCursor"],
                         next_request_page_size,
-                        is_site_admin=is_site_admin,
-                        include_index_failure_fields=include_index_failure_fields,
+                        can_read_protected_fields=can_read_protected_fields,
+                        schema=schema,
                         max_retries=max_retries,
                     )
 
@@ -2478,11 +2778,31 @@ def fetch_repos(
             page = next_page.result()
 
 
-def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
+def extract_csv_values(
+    repo: dict[str, Any],
+    columns: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]],
+    unavailable_values: dict[str, str],
+) -> list[Any]:
+    """Extract supported columns and substitute schema-version markers"""
+    return [
+        (
+            unavailable_values[column_name]
+            if column_name in unavailable_values
+            else extract(repo)
+        )
+        for column_name, extract, _, _, _ in columns
+    ]
+
+
+def build_row(
+    repo: dict[str, Any],
+    endpoint: str,
+    unavailable_values: dict[str, str],
+) -> list[Any]:
     """Build a base CSV row and absolutize the repo URL"""
     base = endpoint.rstrip("/")
-    row = [extract(repo) for _, extract, _, _, _ in COLUMNS]
-    if row[URL_COLUMN_INDEX]:
+    row = extract_csv_values(repo, COLUMNS, unavailable_values)
+    if "url" not in unavailable_values and row[URL_COLUMN_INDEX]:
         row[URL_COLUMN_INDEX] = base + row[URL_COLUMN_INDEX]
     return row
 
@@ -2710,10 +3030,12 @@ def collect_repo_processing_result(
     count_commits_rev: str,
     run_search_pattern: str | None,
     skipped_file_reasons: bool,
+    schema: GraphQLSchema,
+    unavailable_values: dict[str, str],
     max_retries: int,
 ) -> RepoProcessingResult:
     """Build the row and run optional per-repo network queries"""
-    row = build_row(repo, endpoint)
+    row = build_row(repo, endpoint, unavailable_values)
     commit_count: int | None = None
     all_refs_count: int | None = None
     commit_elapsed_seconds: float | None = None
@@ -2735,6 +3057,8 @@ def collect_repo_processing_result(
             token,
             repo_name,
             count_commits_rev,
+            schema=schema,
+            unavailable_values=unavailable_values,
             max_retries=max_retries,
         )
     if run_search_pattern is not None:
@@ -2862,12 +3186,13 @@ def iter_repo_processing_results(
     *,
     page_size: int,
     scope_repo: str | None,
-    is_site_admin: bool,
-    include_index_failure_fields: bool,
+    can_read_protected_fields: bool,
+    schema: GraphQLSchema,
     count_commits: bool,
     count_commits_rev: str,
     run_search_pattern: str | None,
     skipped_file_reasons: bool,
+    unavailable_values: dict[str, str],
     concurrency: int,
     max_retries: int,
 ) -> Iterator[RepoProcessingResult]:
@@ -2878,8 +3203,8 @@ def iter_repo_processing_results(
         max_repos,
         page_size=page_size,
         scope_repo=scope_repo,
-        is_site_admin=is_site_admin,
-        include_index_failure_fields=include_index_failure_fields,
+        can_read_protected_fields=can_read_protected_fields,
+        schema=schema,
         max_retries=max_retries,
     )
     use_threads = concurrency > 1 and (
@@ -2897,6 +3222,8 @@ def iter_repo_processing_results(
                 count_commits_rev=count_commits_rev,
                 run_search_pattern=run_search_pattern,
                 skipped_file_reasons=skipped_file_reasons,
+                schema=schema,
+                unavailable_values=unavailable_values,
                 max_retries=max_retries,
             )
         return
@@ -2923,6 +3250,8 @@ def iter_repo_processing_results(
             count_commits_rev=count_commits_rev,
             run_search_pattern=run_search_pattern,
             skipped_file_reasons=skipped_file_reasons,
+            schema=schema,
+            unavailable_values=unavailable_values,
             max_retries=max_retries,
         )
         pending_results[future] = index
@@ -2969,8 +3298,9 @@ def write_csv(
     concurrency: int = DEFAULT_CONCURRENCY,
     max_retries: int = DEFAULT_MAX_RETRIES,
     stats: StatsCollector | None = None,
-    is_site_admin: bool,
-    include_index_failure_fields: bool,
+    can_read_protected_fields: bool,
+    schema: GraphQLSchema,
+    unavailable_values: dict[str, str],
 ) -> tuple[int, int, int]:
     """Stream repos to CSVs and optionally trigger reclone/reindex mutations"""
     run_search_enabled = run_search_pattern is not None
@@ -2993,12 +3323,13 @@ def write_csv(
         max_repos,
         page_size=page_size,
         scope_repo=scope_repo,
-        is_site_admin=is_site_admin,
-        include_index_failure_fields=include_index_failure_fields,
+        can_read_protected_fields=can_read_protected_fields,
+        schema=schema,
         count_commits=count_commits,
         count_commits_rev=count_commits_rev,
         run_search_pattern=run_search_pattern,
         skipped_file_reasons=skipped_file_reasons_enabled,
+        unavailable_values=unavailable_values,
         concurrency=concurrency,
         max_retries=max_retries,
     ):
@@ -3020,16 +3351,23 @@ def write_csv(
         total += 1
         if stats is not None:
             stats.add(repo)
-        repo_has_cloning_error = has_cloning_error(repo)
-        repo_has_indexing_error = has_indexing_error(repo)
+        repo_has_cloning_error = (
+            "mirrorInfo.status" not in unavailable_values and has_cloning_error(repo)
+        )
+        repo_has_indexing_error = (
+            "mirrorInfo.status" not in unavailable_values
+            and "textSearchIndex.status" not in unavailable_values
+            and has_indexing_error(repo)
+        )
         if repo_has_cloning_error:
             cloning_writer.writerow(
                 append_processing_result_columns(
                     row
-                    + [
-                        extract(repo)
-                        for _, extract, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
-                    ],
+                    + extract_csv_values(
+                        repo,
+                        CLONING_ERROR_EXTRA_COLUMNS,
+                        unavailable_values,
+                    ),
                     result,
                     count_commits=count_commits,
                     run_search=run_search_enabled,
@@ -3058,10 +3396,11 @@ def write_csv(
             skipped_writer.writerow(
                 append_processing_result_columns(
                     row
-                    + [
-                        extract(repo)
-                        for _, extract, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
-                    ],
+                    + extract_csv_values(
+                        repo,
+                        SKIPPED_FILES_EXTRA_COLUMNS,
+                        unavailable_values,
+                    ),
                     result,
                     count_commits=count_commits,
                     run_search=run_search_enabled,
@@ -3411,7 +3750,32 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     else:
         scope_repo = None
         scope_rev = "HEAD"
-    username, is_site_admin = fetch_current_user(
+    sourcegraph_version = fetch_sourcegraph_version(
+        endpoint,
+        token,
+        max_retries=args.max_retries,
+    )
+    logger.info("Sourcegraph version: %s", sourcegraph_version)
+    schema = fetch_graphql_schema(
+        endpoint,
+        token,
+        max_retries=args.max_retries,
+    )
+    unavailable_values = unavailable_csv_column_values(
+        schema,
+        sourcegraph_version,
+    )
+    logger.info(
+        "GraphQL schema checked: %d CSV column(s) unavailable",
+        len(unavailable_values),
+    )
+    if unavailable_values:
+        logger.info(
+            "Unavailable CSV columns will contain %r: %s",
+            next(iter(unavailable_values.values())),
+            ", ".join(sorted(unavailable_values)),
+        )
+    username, is_site_admin, can_read_protected_fields = fetch_current_user(
         endpoint,
         token,
         max_retries=args.max_retries,
@@ -3420,7 +3784,15 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         "Connected to: %s as: %s (%s)",
         endpoint,
         username,
-        "site admin" if is_site_admin else "non-admin",
+        (
+            "site admin"
+            if is_site_admin
+            else (
+                "non-admin with REPO_MANAGEMENT#READ"
+                if can_read_protected_fields
+                else "non-admin"
+            )
+        ),
     )
 
     # Refuse admin-only mutations before a run starts emitting per-repo warnings
@@ -3438,12 +3810,13 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             f"{username!r} is not a site admin on {endpoint}",
         )
 
-    if not is_site_admin:
-        # Some admin-only fields are skipped or returned as null for non-admins
+    if not can_read_protected_fields:
+        unavailable_values.update(admin_required_csv_column_values())
         logger.warning(
-            "Non-admin token: skipping Repository.externalServices selection; "
+            "Token lacks REPO_MANAGEMENT#READ: skipping "
+            "Repository.externalServices selection; "
             "mirrorInfo.remoteURL, mirrorInfo.shard, and "
-            "mirrorInfo.repositoryStatistics will be empty in the CSV",
+            "mirrorInfo.repositoryStatistics columns will contain 'requires admin'",
         )
 
     # This targeted report does not need the full repo listing
@@ -3477,12 +3850,6 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             max_retries=args.max_retries,
         )
         return
-
-    include_index_failure_fields = supports_text_search_index_failure_fields(
-        endpoint,
-        token,
-        max_retries=args.max_retries,
-    )
 
     # Prefix outputs with endpoint, plus scoped repo/rev when applicable
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
@@ -3593,8 +3960,9 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             concurrency=args.concurrency,
             max_retries=args.max_retries,
             stats=stats,
-            is_site_admin=is_site_admin,
-            include_index_failure_fields=include_index_failure_fields,
+            can_read_protected_fields=can_read_protected_fields,
+            schema=schema,
+            unavailable_values=unavailable_values,
         )
 
     if stats is not None:
