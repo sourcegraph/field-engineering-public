@@ -1,0 +1,14 @@
+[tools]
+node = "20"
+
+[tasks.setup]
+description = "Install the backend and frontend dependencies"
+run = "npm ci --prefix backend && npm ci --prefix frontend"
+
+[tasks.build]
+description = "Build the frontend"
+run = "npm run build --prefix frontend"
+
+[tasks.test]
+description = "Run backend tests once, allowing the current empty test suite"
+run = "npm test --prefix backend -- --runInBand --passWithNoTests"

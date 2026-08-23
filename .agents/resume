@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+
+command -v mise >/dev/null
+
+echo "Orb tool manager is ready."

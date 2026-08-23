@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+local_binary_directory="$HOME/.local/bin"
+profile_marker="# field-engineering-public orb tools"
+
+timed_step() {
+  local description="$1"
+  shift
+  echo "==> $description"
+  time "$@"
+}
+
+mkdir -p "$local_binary_directory"
+export PATH="$local_binary_directory:$PATH"
+
+if ! command -v curl >/dev/null; then
+  echo "curl is required to install the repository toolchain" >&2
+  exit 1
+fi
+
+if ! command -v mise >/dev/null; then
+  timed_step "Installing mise" bash -c 'curl https://mise.run | sh'
+fi
+
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# field-engineering-public orb tools
+export PATH="$HOME/.local/bin:$PATH"
+if command -v mise >/dev/null; then
+  eval "$(mise activate bash)"
+fi
+EOF
+fi
+
+echo "Orb bootstrap complete. Install tools and dependencies only for the directory being worked on."

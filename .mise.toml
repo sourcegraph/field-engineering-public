@@ -1,4 +1,0 @@
-[tools]
-gradle = "latest"
-java = "temurin-17"
-node = "latest"

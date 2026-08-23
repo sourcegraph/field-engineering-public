@@ -1,0 +1,11 @@
+[tools]
+python = "3.14"
+uv = "0.12.5"
+
+[tasks.setup]
+description = "Install locked Python dependencies"
+run = "uv sync --frozen"
+
+[tasks.test]
+description = "Run the unit tests"
+run = "uv run python -m unittest discover tests"
