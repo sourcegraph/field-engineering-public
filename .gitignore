@@ -1,4 +1,5 @@
 __pycache__
+.amp/portals/*
 .DS_Store
 .idea
 .ruff_cache
@@ -9,10 +10,10 @@ __pycache__
 *.egg-info/
 *.env*
 *.log
-.amp/portals/*
-bin/
-node_modules/
+*.tsv
 *runs/
 bin/
+bin/
+node_modules/
 notes/
 schema.gql

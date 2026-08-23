@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, TextIO
 
-
-DEFAULT_ROOT = Path("~/git")
-DEFAULT_OUTPUT = Path("zoekt-trigram-counts.tsv")
-DEFAULT_THRESHOLD = 20_000
-DEFAULT_PATH_SUFFIX_LENGTH = 20
+DEFAULT_OUTPUT = Path("zoekt-index-analyzer.tsv")
+MAX_FILE_SIZE_BYTES = 1_048_576
+MIN_TRIGRAM_FILE_SIZE_BYTES = 3
+MAX_UNIQUE_TRIGRAMS = 20_000
+PROGRESS_INTERVAL_FILES = 1_000
 READ_CHUNK_SIZE = 1_048_576
 RUNE_ERROR: Final = 0xFFFD
 
@@ -41,11 +41,12 @@ class DecodedRune:
 
 @dataclass(frozen=True)
 class CountedFile:
-    """Zoekt-style unique trigram count for one text file."""
+    """Local file measurements used by Zoekt's skip checks."""
 
     path: str
     byte_size: int
     unique_trigrams: int
+    contains_binary_content: bool
 
 
 @dataclass(frozen=True)
@@ -60,94 +61,31 @@ class SkippedFile:
 FileProcessingResult = CountedFile | SkippedFile
 
 
-def parse_non_negative_integer(value_text: str) -> int:
-    """Parse an argparse integer value that must be zero or greater."""
-    try:
-        value = int(value_text)
-    except ValueError:
-        message = f"{value_text!r} is not an integer"
-        raise argparse.ArgumentTypeError(message) from None
-    if value < 0:
-        message = f"{value_text!r} must be zero or greater"
-        raise argparse.ArgumentTypeError(message)
-    return value
-
-
-def parse_positive_integer(value_text: str) -> int:
-    """Parse an argparse integer value that must be one or greater."""
-    value = parse_non_negative_integer(value_text)
-    if value == 0:
-        message = f"{value_text!r} must be one or greater"
-        raise argparse.ArgumentTypeError(message)
-    return value
-
-
 def parse_arguments(argument_values: Sequence[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Count Sourcegraph Zoekt-style unique trigrams for local files. "
-            "Git worktrees are listed with `git ls-files --cached --others "
-            "--exclude-standard`, so .gitignore-covered files are excluded. "
-            "Binary means Zoekt's null-byte binary check."
+            "Analyze a local file or directory using Sourcegraph Zoekt's file "
+            "skip checks. Directory scans exclude Git-ignored files. Results "
+            f"are written to {DEFAULT_OUTPUT}."
         )
     )
     parser.add_argument(
-        "--root",
+        "path",
+        nargs="?",
         type=Path,
-        default=DEFAULT_ROOT,
-        help="Root directory to scan. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="TSV output path, or '-' for stdout. Default: %(default)s",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=parse_non_negative_integer,
-        default=DEFAULT_THRESHOLD,
-        help="Zoekt TrigramMax threshold used for the would-skip column.",
-    )
-    parser.add_argument(
-        "--dedupe-path-suffix-length",
-        type=parse_non_negative_integer,
-        default=DEFAULT_PATH_SUFFIX_LENGTH,
-        help=(
-            "Skip later files whose full path has the same final N characters. "
-            "Use 0 to disable. Default: %(default)s"
-        ),
-    )
-    parser.add_argument(
-        "--workers",
-        type=parse_positive_integer,
-        default=max(1, os.cpu_count() or 1),
-        help="Worker processes used while counting. Default: CPU count.",
-    )
-    parser.add_argument(
-        "--sort",
-        choices=("trigrams", "path"),
-        default="trigrams",
-        help="Sort TSV rows by descending trigram count or by path.",
-    )
-    parser.add_argument(
-        "--progress-every",
-        type=parse_non_negative_integer,
-        default=1_000,
-        help="Print progress every N files to stderr. Use 0 to disable.",
+        default=Path.cwd(),
+        help="File or directory to analyze. Default: current working directory.",
     )
     return parser.parse_args(argument_values)
 
 
-def resolve_scan_root(root: Path) -> Path:
-    """Expand and validate the scan root."""
-    resolved_root = root.expanduser().resolve()
-    if not resolved_root.exists():
-        raise SystemExit(f"scan root does not exist: {resolved_root}")
-    if not resolved_root.is_dir():
-        raise SystemExit(f"scan root is not a directory: {resolved_root}")
-    return resolved_root
+def resolve_input_path(path: Path) -> Path:
+    """Expand and validate the file or directory to analyze."""
+    resolved_path = path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise SystemExit(f"path does not exist: {resolved_path}")
+    return resolved_path
 
 
 def find_containing_git_worktree(root: Path) -> Path | None:
@@ -217,8 +155,7 @@ def iter_git_worktree_files(git_worktree: Path) -> Iterator[Path]:
         completed_process = subprocess.run(
             command,
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
     except FileNotFoundError:
         raise SystemExit("git was not found in PATH") from None
@@ -264,47 +201,31 @@ def is_relative_to(path: Path, root: Path) -> bool:
 
 
 def path_sort_text(path: Path) -> str:
-    """Return a stable text form for path sorting and suffix comparison."""
+    """Return a stable text form for path sorting and comparison."""
     return path.as_posix()
-
-
-def dedupe_by_path_suffix(
-    candidate_files: list[Path], path_suffix_length: int
-) -> tuple[list[Path], int]:
-    """Skip later paths with the same final N characters."""
-    if path_suffix_length == 0:
-        return candidate_files, 0
-
-    seen_path_suffixes: set[str] = set()
-    kept_files: list[Path] = []
-    skipped_count = 0
-
-    for file_path in candidate_files:
-        path_text = path_sort_text(file_path)
-        path_suffix = path_text[-path_suffix_length:]
-        if path_suffix in seen_path_suffixes:
-            skipped_count += 1
-            continue
-        seen_path_suffixes.add(path_suffix)
-        kept_files.append(file_path)
-
-    return kept_files, skipped_count
 
 
 def exclude_output_file(candidate_files: list[Path], output_path: Path) -> list[Path]:
     """Do not count a pre-existing TSV from an earlier run."""
-    if str(output_path) == "-":
-        return candidate_files
-
-    expanded_output_path = output_path.expanduser()
-    if not expanded_output_path.is_absolute():
-        expanded_output_path = Path.cwd() / expanded_output_path
-    output_path_text = path_sort_text(expanded_output_path.resolve(strict=False))
+    output_path_text = path_sort_text(output_path.resolve(strict=False))
     return [
         candidate_file
         for candidate_file in candidate_files
-        if path_sort_text(candidate_file) != output_path_text
+        if path_sort_text(candidate_file.resolve(strict=False)) != output_path_text
     ]
+
+
+def collect_input_files(input_path: Path, output_path: Path) -> list[Path]:
+    """Return one requested file or every eligible file under a directory."""
+    if input_path.is_file() or input_path.is_symlink():
+        return exclude_output_file([input_path], output_path)
+    if not input_path.is_dir():
+        raise SystemExit(f"path is not a regular file or directory: {input_path}")
+    discovered_files = discover_files(input_path)
+    return exclude_output_file(
+        collect_candidate_files(discovered_files, input_path),
+        output_path,
+    )
 
 
 def decode_go_utf8_prefix(
@@ -442,7 +363,7 @@ def add_trigram_codepoint(
     trigrams: set[int], first_previous: int, second_previous: int, codepoint: int
 ) -> tuple[int, int]:
     """Shift one rune into the current trigram window."""
-    if first_previous != 0:
+    if first_previous >= 0:
         trigrams.add((first_previous << 42) | (second_previous << 21) | codepoint)
     return second_previous, codepoint
 
@@ -478,12 +399,12 @@ def count_buffer_trigrams(
 def count_bytes_trigrams(content: bytes) -> int:
     """Count unique Zoekt-style three-rune trigrams in a byte string."""
     trigrams: set[int] = set()
-    leftover_bytes, first_previous, second_previous = count_buffer_trigrams(
+    leftover_bytes, _, _ = count_buffer_trigrams(
         content,
         final=True,
         trigrams=trigrams,
-        first_previous=0,
-        second_previous=0,
+        first_previous=-1,
+        second_previous=-1,
     )
     if leftover_bytes:
         raise RuntimeError("final trigram count left undecoded bytes")
@@ -491,11 +412,12 @@ def count_bytes_trigrams(content: bytes) -> int:
 
 
 def process_regular_file(file_path: Path, byte_size: int) -> FileProcessingResult:
-    """Count trigrams in a regular file without loading it all into memory."""
+    """Measure a regular file without loading it all into memory."""
     trigrams: set[int] = set()
     leftover_bytes = b""
-    first_previous = 0
-    second_previous = 0
+    first_previous = -1
+    second_previous = -1
+    contains_binary_content = False
 
     try:
         with file_path.open("rb") as file_handle:
@@ -503,8 +425,7 @@ def process_regular_file(file_path: Path, byte_size: int) -> FileProcessingResul
                 chunk = file_handle.read(READ_CHUNK_SIZE)
                 if not chunk:
                     break
-                if b"\0" in chunk:
-                    return SkippedFile(str(file_path), "binary")
+                contains_binary_content = contains_binary_content or b"\0" in chunk
 
                 content = leftover_bytes + chunk
                 leftover_bytes, first_previous, second_previous = count_buffer_trigrams(
@@ -528,7 +449,12 @@ def process_regular_file(file_path: Path, byte_size: int) -> FileProcessingResul
     except OSError as error:
         return SkippedFile(str(file_path), "read_error", str(error))
 
-    return CountedFile(str(file_path), byte_size, len(trigrams))
+    return CountedFile(
+        str(file_path),
+        byte_size,
+        len(trigrams),
+        contains_binary_content,
+    )
 
 
 def process_file(file_path_text: str) -> FileProcessingResult:
@@ -544,7 +470,12 @@ def process_file(file_path_text: str) -> FileProcessingResult:
             content = os.fsencode(os.readlink(file_path))
         except OSError as error:
             return SkippedFile(file_path_text, "readlink_error", str(error))
-        return CountedFile(file_path_text, len(content), count_bytes_trigrams(content))
+        return CountedFile(
+            file_path_text,
+            len(content),
+            count_bytes_trigrams(content),
+            b"\0" in content,
+        )
 
     if not stat.S_ISREG(file_status.st_mode):
         return SkippedFile(file_path_text, "not_regular_file")
@@ -553,40 +484,30 @@ def process_file(file_path_text: str) -> FileProcessingResult:
 
 
 def process_files(
-    candidate_files: list[Path], *, workers: int, progress_every: int
+    candidate_files: list[Path],
 ) -> tuple[list[CountedFile], dict[str, int], list[SkippedFile]]:
-    """Count files and summarize skipped files."""
-    counted_files: list[CountedFile] = []
-    skipped_counts: dict[str, int] = {}
-    skipped_examples: list[SkippedFile] = []
+    """Analyze files in parallel and summarize failures."""
     path_texts = [str(file_path) for file_path in candidate_files]
+    workers = max(1, os.cpu_count() or 1)
 
-    if workers == 1:
+    if workers == 1 or len(path_texts) <= 1:
         processing_results = map(process_file, path_texts)
-        counted_files, skipped_counts, skipped_examples = collect_processing_results(
-            processing_results,
-            total_files=len(path_texts),
-            progress_every=progress_every,
+        return collect_processing_results(
+            processing_results, total_files=len(path_texts)
         )
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
             processing_results = executor.map(process_file, path_texts, chunksize=16)
-            counted_files, skipped_counts, skipped_examples = (
-                collect_processing_results(
-                    processing_results,
-                    total_files=len(path_texts),
-                    progress_every=progress_every,
-                )
+            return collect_processing_results(
+                processing_results,
+                total_files=len(path_texts),
             )
-
-    return counted_files, skipped_counts, skipped_examples
 
 
 def collect_processing_results(
     processing_results: Iterator[FileProcessingResult],
     *,
     total_files: int,
-    progress_every: int,
 ) -> tuple[list[CountedFile], dict[str, int], list[SkippedFile]]:
     """Collect worker results and print progress."""
     counted_files: list[CountedFile] = []
@@ -603,7 +524,7 @@ def collect_processing_results(
             if len(skipped_examples) < 10:
                 skipped_examples.append(processing_result)
 
-        if progress_every and processed_count % progress_every == 0:
+        if processed_count % PROGRESS_INTERVAL_FILES == 0:
             print(
                 f"processed {processed_count:,}/{total_files:,} files...",
                 file=sys.stderr,
@@ -612,60 +533,50 @@ def collect_processing_results(
     return counted_files, skipped_counts, skipped_examples
 
 
-def sort_counted_files(counted_files: list[CountedFile], sort: str) -> None:
-    """Sort counted files in place."""
-    if sort == "path":
-        counted_files.sort(key=lambda counted_file: counted_file.path)
-    else:
-        counted_files.sort(
-            key=lambda counted_file: (-counted_file.unique_trigrams, counted_file.path)
-        )
+def skip_reason_values(counted_file: CountedFile) -> tuple[bool, bool, bool, bool]:
+    """Return Zoekt skip checks in evaluation order."""
+    return (
+        counted_file.byte_size > MAX_FILE_SIZE_BYTES,
+        0 < counted_file.byte_size < MIN_TRIGRAM_FILE_SIZE_BYTES,
+        counted_file.contains_binary_content,
+        counted_file.unique_trigrams > MAX_UNIQUE_TRIGRAMS,
+    )
 
 
 def write_tab_separated_values(
     output_path: Path,
     counted_files: list[CountedFile],
-    *,
-    threshold: int,
 ) -> None:
-    """Write counted files to TSV."""
-    if str(output_path) == "-":
-        write_tab_separated_values_to_file(
-            sys.stdout, counted_files, threshold=threshold
-        )
-        return
-
-    resolved_output_path = output_path.expanduser()
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_output_path.open("w", encoding="utf-8", newline="") as file_handle:
-        write_tab_separated_values_to_file(
-            file_handle, counted_files, threshold=threshold
-        )
+    """Write one row per analyzed file to TSV."""
+    with output_path.open("w", encoding="utf-8", newline="") as file_handle:
+        write_tab_separated_values_to_file(file_handle, counted_files)
 
 
 def write_tab_separated_values_to_file(
     file_handle: TextIO,
     counted_files: list[CountedFile],
-    *,
-    threshold: int,
 ) -> None:
     """Write TSV rows to an open file handle."""
     writer = csv.writer(file_handle, delimiter="\t", lineterminator="\n")
     writer.writerow(
         [
-            "unique_trigrams",
-            "would_skip_too_many_trigrams",
-            "byte_size",
             "path",
+            "byte_size",
+            "unique_trigrams",
+            "exceeds_maximum_size",
+            "contains_too_few_trigrams",
+            "contains_binary_content",
+            "contains_too_many_trigrams",
         ]
     )
     for counted_file in counted_files:
+        skip_reasons = skip_reason_values(counted_file)
         writer.writerow(
             [
-                counted_file.unique_trigrams,
-                str(counted_file.unique_trigrams > threshold).lower(),
-                counted_file.byte_size,
                 counted_file.path,
+                counted_file.byte_size,
+                counted_file.unique_trigrams,
+                *(str(value).lower() for value in skip_reasons),
             ]
         )
 
@@ -673,76 +584,48 @@ def write_tab_separated_values_to_file(
 def print_summary(
     *,
     output_path: Path,
-    discovered_files: DiscoveredFiles,
-    candidate_count: int,
-    suffix_duplicate_count: int,
     counted_files: list[CountedFile],
     skipped_counts: dict[str, int],
     skipped_examples: list[SkippedFile],
-    threshold: int,
 ) -> None:
     """Print a short run summary to stderr."""
-    too_many_trigrams_count = sum(
-        1 for counted_file in counted_files if counted_file.unique_trigrams > threshold
+    print(f"Analyzed files: {len(counted_files):,}", file=sys.stderr)
+    skip_reason_counts = [0, 0, 0, 0]
+    for counted_file in counted_files:
+        for index, matches in enumerate(skip_reason_values(counted_file)):
+            skip_reason_counts[index] += int(matches)
+    reason_names = (
+        "exceeds maximum size",
+        "contains too few trigrams",
+        "contains binary content",
+        "contains too many trigrams",
     )
-    print(f"Git worktrees: {len(discovered_files.git_worktrees):,}", file=sys.stderr)
-    print(
-        f"Plain non-Git files: {len(discovered_files.plain_files):,}", file=sys.stderr
-    )
-    print(
-        f"Candidate files before suffix de-dupe: {candidate_count:,}", file=sys.stderr
-    )
-    print(
-        f"Skipped duplicate path suffixes: {suffix_duplicate_count:,}", file=sys.stderr
-    )
-    print(f"Counted text files: {len(counted_files):,}", file=sys.stderr)
-    print(
-        f"Files over {threshold:,} unique trigrams: {too_many_trigrams_count:,}",
-        file=sys.stderr,
-    )
+    for reason, count in zip(reason_names, skip_reason_counts, strict=True):
+        print(f"Matches {reason}: {count:,}", file=sys.stderr)
     for reason, count in sorted(skipped_counts.items()):
-        print(f"Skipped {reason}: {count:,}", file=sys.stderr)
+        print(f"Could not analyze {reason}: {count:,}", file=sys.stderr)
     for skipped_file in skipped_examples:
         detail = f": {skipped_file.detail}" if skipped_file.detail else ""
         print(
-            f"example skipped {skipped_file.reason}: {skipped_file.path}{detail}",
+            f"example {skipped_file.reason}: {skipped_file.path}{detail}",
             file=sys.stderr,
         )
-    if str(output_path) != "-":
-        print(f"Wrote {output_path.expanduser()}", file=sys.stderr)
+    print(f"Wrote {output_path}", file=sys.stderr)
 
 
 def run(parsed_arguments: argparse.Namespace) -> None:
-    """Run the trigram count command."""
-    root = resolve_scan_root(parsed_arguments.root)
-    discovered_files = discover_files(root)
-    candidate_files = collect_candidate_files(discovered_files, root)
-    candidate_files = exclude_output_file(candidate_files, parsed_arguments.output)
-    candidate_count = len(candidate_files)
-    candidate_files, suffix_duplicate_count = dedupe_by_path_suffix(
-        candidate_files,
-        parsed_arguments.dedupe_path_suffix_length,
-    )
-    counted_files, skipped_counts, skipped_examples = process_files(
-        candidate_files,
-        workers=parsed_arguments.workers,
-        progress_every=parsed_arguments.progress_every,
-    )
-    sort_counted_files(counted_files, parsed_arguments.sort)
-    write_tab_separated_values(
-        parsed_arguments.output,
-        counted_files,
-        threshold=parsed_arguments.threshold,
-    )
+    """Analyze the requested path and write the fixed TSV output."""
+    input_path = resolve_input_path(parsed_arguments.path)
+    output_path = Path.cwd() / DEFAULT_OUTPUT
+    candidate_files = collect_input_files(input_path, output_path)
+    counted_files, skipped_counts, skipped_examples = process_files(candidate_files)
+    counted_files.sort(key=lambda counted_file: counted_file.path)
+    write_tab_separated_values(output_path, counted_files)
     print_summary(
-        output_path=parsed_arguments.output,
-        discovered_files=discovered_files,
-        candidate_count=candidate_count,
-        suffix_duplicate_count=suffix_duplicate_count,
+        output_path=output_path,
         counted_files=counted_files,
         skipped_counts=skipped_counts,
         skipped_examples=skipped_examples,
-        threshold=parsed_arguments.threshold,
     )
 
 

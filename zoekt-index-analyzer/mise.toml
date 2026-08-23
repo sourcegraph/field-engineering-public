@@ -1,5 +1,5 @@
 [tools]
-python = "3.9"
+python = "3.10"
 
 [tasks.setup]
 description = "Verify the Python runtime; this script has no third-party dependencies"
@@ -7,4 +7,4 @@ run = "python --version"
 
 [tasks.check]
 description = "Check that the script compiles"
-run = "python -m py_compile zoekt_skip_reasons.py"
+run = "python -m py_compile zoekt-index-analyzer.py"
