@@ -2398,11 +2398,11 @@ class SourcegraphClient:
                 time.monotonic() + delay,
             )
         logger.warning(
-            "%s; retrying (%d/%d) after %.1fs shared backpressure...",
-            reason,
+            "Retrying (%d/%d) after %.1fs shared backpressure; %s",
             retry_number,
             self.max_retries,
             delay,
+            reason,
         )
         self._wait_for_backpressure()
 
