@@ -2,7 +2,7 @@ name: Diff Tour link
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, closed]
 
 permissions:
   pull-requests: write # needed to create/update comments
@@ -12,18 +12,27 @@ jobs:
     runs-on: ubuntu-latest
     # DiffTour resolves branch names against this repository, so the head
     # branch must live on this repo (skip fork PRs).
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Closed PRs only need an update when they were merged.
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.action != 'closed' || github.event.pull_request.merged)
     steps:
       - uses: actions/github-script@v7
         with:
           script: |
             const instance = 'https://sourcegraph.sourcegraph.com';
             const repo = `github.com/${context.payload.repository.full_name}`;
-            const base = context.payload.pull_request.base.ref;
-            const head = context.payload.pull_request.head.ref;
+            const pullRequest = context.payload.pull_request;
 
-            const range = `${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
-            const url = `${instance}/r/${repo}/-/compare/${range}?mode=Tour`;
+            let url;
+            if (pullRequest.merged) {
+              const commit = encodeURIComponent(pullRequest.merge_commit_sha);
+              url = `${instance}/r/${repo}/-/commit/${commit}?mode=Tour`;
+            } else {
+              const base = encodeURIComponent(pullRequest.base.ref);
+              const head = encodeURIComponent(pullRequest.head.ref);
+              url = `${instance}/r/${repo}/-/compare/${base}...${head}?mode=Tour`;
+            }
 
             const marker = '<!-- difftour-link -->';
             const body = `${marker}\n[Open the Diff Tour for this PR in Sourcegraph](${url})`;
