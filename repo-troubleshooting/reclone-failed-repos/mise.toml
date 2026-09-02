@@ -1,0 +1,11 @@
+[tools]
+python = "3.10"
+uv = "0.12.5"
+
+[tasks.setup]
+description = "Verify the Python runtime; this script has no third-party dependencies"
+run = "python --version"
+
+[tasks.check]
+description = "Run Python lint, format, and type checks"
+run = "uvx ruff check reclone_failed_repos.py && uvx ruff format --check reclone_failed_repos.py && uvx pyright reclone_failed_repos.py"
