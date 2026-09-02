@@ -3,8 +3,8 @@
 Export repository health and size metadata from a Sourcegraph instance to CSV
 
 The script is meant for support and troubleshooting work: it streams the repo
-list through Sourcegraph's GraphQL API, writes endpoint-prefixed CSV files, and
-keeps memory use flat on large instances
+list through Sourcegraph's GraphQL API, writes CSV files per run, and keeps
+memory use flat on large instances
 
 ## Requirements
 
@@ -71,13 +71,33 @@ python3 list-repos.py --run-search 'TODO patternType:literal'
 python3 list-repos.py --statistics
 ```
 
-Site admins can also trigger repair mutations:
+### Failed repos
+
+`--failed` narrows the run to repos with cloning errors, using server-side
+filters (`failedFetch`, `corrupted`, `cloneStatus: NOT_CLONED`) instead of
+scanning every repo. The same client-side error detection is then applied, so
+the result matches `repos-with-cloning-errors.csv` from a full run, in a
+fraction of the time on large instances
 
 ```sh
-# Reclone every repo currently in a cloning-error state
-python3 list-repos.py --reclone
+# List only repos with cloning errors
+python3 list-repos.py --failed
 
-# Reclone one repo, whether in an error state or not
+# Trigger a fetch (updateMirrorRepository) on every failed repo
+python3 list-repos.py --failed --fetch
+
+# Reclone (recloneRepository) every failed repo
+python3 list-repos.py --failed --reclone
+```
+
+### Repair mutations
+
+Site admins can trigger repair mutations. `--fetch` and `--reclone` are
+mutually exclusive, and without a `REPO` they require `--failed`:
+
+```sh
+# Fetch or reclone one repo, whether in an error state or not
+python3 list-repos.py --fetch github.com/org/repo
 python3 list-repos.py --reclone github.com/org/repo
 
 # Reindex every cloned repo missing a search index
@@ -87,25 +107,32 @@ python3 list-repos.py --reindex
 python3 list-repos.py --reindex github.com/org/repo
 ```
 
+Mutations are sent in aliased batches of 10 per GraphQL request, with up to
+`--concurrency` requests in flight. Recloning is expensive on gitserver, so
+lower `--concurrency` when recloning thousands of repos
+
+Each repo's outcome lands in the `action` and `result` CSV columns, for example
+`reclone triggered`, `reclone skipped` (another reclone is already in
+progress), or `reclone failed` with the server's error message
+
 ## Output files
 
-- Output files are written in the current directory
-- Filenames are prefixed with the hostname from `SRC_ENDPOINT`
+Each run writes to `list-repos-runs/<endpoint>/<timestamp>/`, so runs never
+overwrite each other
 
-Possible output files:
+| File                                | When written                                              |
+| ----------------------------------- | --------------------------------------------------------- |
+| `list-repos.log`                    | Every run                                                 |
+| `repos.csv`                         | Every listing run                                         |
+| `repos-with-cloning-errors.csv`     | When one or more repos have a cloning or corruption error |
+| `repos-with-indexing-errors.csv`    | When one or more cloned repos are missing a search index  |
+| `repos-with-skipped-files.csv`      | With `--skipped-files` and one or more skipped-file repos |
+| `stats-*.csv`                       | With `--statistics`                                       |
+| `skipped-files-reason-details.csv`  | With `--skipped-files-reason REPO[@REV]`                  |
+| `skipped-files-reason-stats.csv`    | With `--skipped-files-reason REPO[@REV]`                  |
 
-| File                                      | When written                                              |
-| ----------------------------------------- | --------------------------------------------------------- |
-| `<prefix>-repos.csv`                      | Every normal listing run                                  |
-| `<prefix>-repos-with-cloning-errors.csv`  | When one or more repos have a cloning or corruption error |
-| `<prefix>-repos-with-indexing-errors.csv` | When one or more cloned repos are missing a search index  |
-| `<prefix>-repos-with-skipped-files.csv`   | With `--skipped-files` and one or more skipped-file repos |
-| `<prefix>-stats-*.csv`                    | With `--statistics`                                       |
-| `<prefix>-<repo>-<rev>-skipped-files.csv` | With `--skipped-files-reason REPO[@REV]`                  |
-| `<prefix>-<repo>-<rev>-skipped-stats.csv` | With `--skipped-files-reason REPO[@REV]`                  |
-
-- Optional columns from `--count-commits` and `--run-search` are appended to the
-  per-repo CSVs
+- Optional columns from `--count-commits`, `--run-search`, and the repair
+  mutations are appended to the per-repo CSVs
 - See [`CSV_SCHEMA.md`](CSV_SCHEMA.md) for the exact columns, types, and
   admin-only fields
 

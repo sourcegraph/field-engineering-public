@@ -235,6 +235,7 @@ REPOSITORY_SELECTION: dict[str, Any] = {
         "updatedAt": None,
         "nextSyncAt": None,
         "updateSchedule": {"intervalSeconds": None},
+        "updateQueue": {"index": None, "updating": None},
         "shard": None,
     },
     "textSearchIndex": {
@@ -409,36 +410,66 @@ def build_repo_node_fragment(
     return f"fragment RepoNodeFields on {repository_type} {{\n{rendered}\n}}\n"
 
 
+# Server-side `repositories(...)` filters unioned by --failed. Each argument's
+# SQL predicate (internal/database/repos.go): failedFetch → last_error IS NOT
+# NULL, corrupted → corrupted_at IS NOT NULL, cloneStatus → clone_status = X.
+# Sourcegraph ANDs the arguments, so each filter is a separate listing query
+FAILED_REPOSITORY_FILTERS: tuple[tuple[str, str], ...] = (
+    ("failedFetch", "failedFetch: true"),
+    ("corrupted", "corrupted: true"),
+    ("cloneStatus", "cloneStatus: NOT_CLONED"),
+)
+
+
+def supported_failed_repository_filters(
+    schema: GraphQLSchema,
+) -> tuple[tuple[str, str], ...]:
+    """Return the --failed filters whose arguments exist on this instance's schema"""
+    arguments = schema.field_arguments.get(schema.query_type, {}).get(
+        "repositories",
+        frozenset(),
+    )
+    return tuple(
+        (argument_name, filter_argument)
+        for argument_name, filter_argument in FAILED_REPOSITORY_FILTERS
+        if argument_name in arguments
+    )
+
+
 def build_repository_listing_query(
     schema: GraphQLSchema,
     *,
     can_read_protected_fields: bool,
+    filter_argument: str = "",
 ) -> str:
     """Return a paginated query containing only supported repository fields"""
+    arguments = "first: $first, after: $after"
+    if filter_argument:
+        arguments += f", {filter_argument}"
     return (
         build_repo_node_fragment(
             schema,
             can_read_protected_fields=can_read_protected_fields,
         )
-        + """
-query ListRepos($first: Int!, $after: String) {
-  repositories(first: $first, after: $after) {
-    nodes {
+        + f"""
+query ListRepos($first: Int!, $after: String) {{
+  repositories({arguments}) {{
+    nodes {{
       ...RepoNodeFields
-    }
+    }}
     totalCount
-    pageInfo {
+    pageInfo {{
       hasNextPage
       endCursor
-    }
-  }
-}
+    }}
+  }}
+}}
 """
     )
 
 
-# Single-repo lookup used by the scoped variants of --count-commits / --reclone
-# / --reindex. Returns the same field set as the listing query (via the shared
+# Single-repo lookup used by the scoped variants of --count-commits / --fetch /
+# --reclone / --reindex. Returns the same field set as the listing query (via the shared
 # fragment) so the rest of the pipeline (build_row, write_csv, the error/skip
 # detectors, etc.) can treat the result identically to a listing-page node
 def build_single_repo_query(
@@ -582,21 +613,34 @@ def build_run_search_query(
     )
 
 
-RECLONE_MUTATION = """
-mutation Reclone($repo: ID!) {
-  recloneRepository(repo: $repo) {
-    alwaysNil
-  }
-}
-"""
+@dataclass(frozen=True)
+class RepositoryMutation:
+    """One site-admin repair mutation, sent in aliased batches"""
 
-REINDEX_MUTATION = """
-mutation Reindex($repository: ID!) {
-  reindexRepository(repository: $repository) {
-    alwaysNil
-  }
-}
-"""
+    action: str
+    field_name: str
+    argument_name: str
+
+
+FETCH_MUTATION = RepositoryMutation("fetch", "updateMirrorRepository", "repository")
+RECLONE_MUTATION = RepositoryMutation("reclone", "recloneRepository", "repo")
+REINDEX_MUTATION = RepositoryMutation("reindex", "reindexRepository", "repository")
+MUTATION_BATCH_SIZE = 10
+# gitserver rejects a reclone while a previous reclone or fetch still holds the
+# repo lock (cmd/gitserver/internal/repositoryservice.go)
+RECLONE_IN_PROGRESS_MESSAGE = "another reclone is in progress"
+
+
+def build_batched_mutation(mutation: RepositoryMutation, count: int) -> str:
+    """Return one mutation document calling `mutation` once per alias m0..m<count-1>"""
+    variables = ", ".join(f"$m{index}: ID!" for index in range(count))
+    calls = "\n".join(
+        f"  m{index}: {mutation.field_name}({mutation.argument_name}: $m{index}) "
+        "{ alwaysNil }"
+        for index in range(count)
+    )
+    return f"mutation Batch({variables}) {{\n{calls}\n}}\n"
+
 
 SKIPPED_FILES_REASON_QUERY = """
 query SkippedFileReasons($query: String!) {
@@ -1173,6 +1217,22 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "integer",
     ),
     (
+        "mirrorInfo.updateQueue.index",
+        lambda r: get_path(r, "mirrorInfo.updateQueue.index"),
+        "Position of the repo in repo-updater's update queue. Repos being "
+        "updated are moved to the end of the queue, so ignore this when "
+        "`mirrorInfo.updateQueue.updating` is `True`",
+        False,
+        "integer",
+    ),
+    (
+        "mirrorInfo.updateQueue.updating",
+        lambda r: get_path(r, "mirrorInfo.updateQueue.updating"),
+        "`True` while repo-updater has a fetch or clone of this repo in progress",
+        False,
+        "boolean",
+    ),
+    (
         "mirrorInfo.shard",
         lambda r: get_path(r, "mirrorInfo.shard"),
         "Pod name of the gitserver shard which holds this repo's clone",
@@ -1383,6 +1443,25 @@ RUN_SEARCH_COLUMNS: list[tuple[str, str, bool, str]] = [
     ),
 ]
 
+# Optional columns appended when --fetch, --reclone, or --reindex is used
+ACTION_COLUMNS: list[tuple[str, str, bool, str]] = [
+    (
+        "action",
+        "What the script did to this repo: `listed` when no mutation applied, "
+        "otherwise `<fetch|reclone|reindex> <triggered|skipped|failed>`; "
+        "semicolon-joined when several mutations applied",
+        True,
+        "string",
+    ),
+    (
+        "result",
+        "GraphQL error or skip message for a `skipped` or `failed` action; "
+        "blank when triggered",
+        True,
+        "string",
+    ),
+]
+
 # Extra columns appended only to the cloning-errors CSV
 CLONING_ERROR_EXTRA_COLUMNS: list[
     tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
@@ -1484,6 +1563,8 @@ CSV_COLUMN_SCHEMA_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "mirrorInfo.updateSchedule.intervalSeconds": (
         ("mirrorInfo", "updateSchedule", "intervalSeconds"),
     ),
+    "mirrorInfo.updateQueue.index": (("mirrorInfo", "updateQueue", "index"),),
+    "mirrorInfo.updateQueue.updating": (("mirrorInfo", "updateQueue", "updating"),),
     "mirrorInfo.shard": (("mirrorInfo", "shard"),),
     "textSearchIndex.status": (("textSearchIndex", "status", "updatedAt"),),
     "textSearchIndex.lastIndexStatus": (("textSearchIndex", "lastIndexStatus"),),
@@ -1906,6 +1987,7 @@ def write_csv_schema(path: Path) -> None:
     skipped_reason_list = format_columns_list(SKIPPED_FILE_REASON_COLUMNS)
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
+    action_list = format_columns_list(ACTION_COLUMNS)
     stats_files_list = format_stats_files_list()
     output_sort_list = format_output_sort_list()
 
@@ -1943,10 +2025,16 @@ sort
 
 {output_sort_list}
 
-The optional `--count-commits` and `--run-search` flags append extra
-columns to the repo-listing CSVs above, excluding the `--stats`
-files and the skipped-file reason detail CSV, in this order: main
-columns → per-CSV extras → commit-count columns → run-search columns
+The optional `--count-commits`, `--run-search`, and repair flags
+(`--fetch`, `--reclone`, `--reindex`) append extra columns to the
+repo-listing CSVs above, excluding the `--stats` files and the
+skipped-file reason detail CSV, in this order: main columns → per-CSV
+extras → commit-count columns → run-search columns → action columns
+
+`--failed` narrows every repo-listing CSV to repos with a cloning error,
+using Sourcegraph's server-side `failedFetch`, `corrupted`, and
+`cloneStatus: NOT_CLONED` filters, so `{DEFAULT_OUTPUT_FILE}` and
+`{DEFAULT_CLONING_ERRORS_FILE}` then list the same repos
 
 ## Main columns
 
@@ -1984,6 +2072,14 @@ Appended to CSV files when `--count-commits` is used
 Appended to CSV files when `--run-search PATTERN` is used
 
 {run_search_list}
+
+## Action columns
+
+Appended to CSV files when `--fetch`, `--reclone`, or `--reindex` is used.
+Mutations are sent in aliased batches of {MUTATION_BATCH_SIZE} per GraphQL
+request, `--concurrency` requests at a time
+
+{action_list}
 
 ## `--stats` files
 
@@ -2042,6 +2138,8 @@ class SourcegraphContext:
     can_read_protected_fields: bool
     schema: GraphQLSchema
     repository_listing_query: str
+    # (repositories argument name, listing query) per supported --failed filter
+    failed_repository_listing_queries: tuple[tuple[str, str], ...]
     single_repository_query: str
     commit_count_query: str
     skipped_file_ref_metadata_query: str
@@ -2413,8 +2511,14 @@ class SourcegraphClient:
         timeout: int = REQUEST_TIMEOUT_SECONDS,
         request_description: str = "GraphQL request",
         validate: Callable[[dict[str, Any]], None] | None = None,
+        allow_graphql_errors: bool = False,
     ) -> dict[str, Any]:
-        """Send a GraphQL query, retrying incomplete response data"""
+        """Send a GraphQL query, retrying incomplete response data
+
+        Returns the response's `data` object. With allow_graphql_errors, returns
+        the whole response (`data` plus any non-retryable `errors`) instead of
+        raising, so batched mutations can attribute errors to individual aliases
+        """
         body = json.dumps({"query": query, "variables": variables}).encode()
         retry_prefix = f"{request_description}: " if request_description else ""
         for retry_count in range(self.max_retries + 1):
@@ -2473,8 +2577,12 @@ class SourcegraphClient:
                         retry_number,
                     )
                     continue
+                if allow_graphql_errors:
+                    return response
                 msg = f"GraphQL errors: {summarize_graphql_errors(errors)}"
                 raise GraphQLError(msg)
+            if allow_graphql_errors:
+                return response
 
             data = response.get("data")
             if not isinstance(data, dict):
@@ -2540,6 +2648,19 @@ class SourcegraphClient:
                 schema,
                 can_read_protected_fields=can_read_protected_fields,
             ),
+            failed_repository_listing_queries=tuple(
+                (
+                    argument_name,
+                    build_repository_listing_query(
+                        schema,
+                        can_read_protected_fields=can_read_protected_fields,
+                        filter_argument=filter_argument,
+                    ),
+                )
+                for argument_name, filter_argument in (
+                    supported_failed_repository_filters(schema)
+                )
+            ),
             single_repository_query=build_single_repo_query(
                 schema,
                 can_read_protected_fields=can_read_protected_fields,
@@ -2572,38 +2693,163 @@ def fetch_single_repo(
     return cast("dict[str, Any]", repo)
 
 
-def trigger_reclone(
-    client: SourcegraphClient,
-    repo_id: str,
-) -> bool:
-    """Send recloneRepository mutation. Returns True on success, False on GraphQL error"""
-    try:
-        client.request(
-            RECLONE_MUTATION,
-            {"repo": repo_id},
-            request_description=f"Reclone repository {repo_id}",
-        )
-    except (GraphQLError, HTTPRequestError) as exc:
-        logger.warning("recloneRepository failed for %s: %s", repo_id, exc)
-        return False
-    return True
+@dataclass(frozen=True)
+class MutationOutcome:
+    """CSV `action` / `result` cells for one mutation on one repo"""
+
+    action: str
+    result: str = ""
 
 
-def trigger_reindex(
+def mutation_outcome(
+    mutation: RepositoryMutation, messages: list[str]
+) -> MutationOutcome:
+    """Classify one alias's GraphQL error messages as triggered, skipped, or failed"""
+    if not messages:
+        return MutationOutcome(f"{mutation.action} triggered")
+    result = "; ".join(messages)
+    if RECLONE_IN_PROGRESS_MESSAGE in result.lower():
+        return MutationOutcome(f"{mutation.action} skipped", result)
+    return MutationOutcome(f"{mutation.action} failed", result)
+
+
+def run_mutation_batch(
     client: SourcegraphClient,
-    repo_id: str,
-) -> bool:
-    """Send reindexRepository mutation. Returns True on success, False on GraphQL error"""
+    mutation: RepositoryMutation,
+    repos: list[dict[str, Any]],
+) -> list[MutationOutcome]:
+    """Send one aliased mutation batch and return an outcome per repo, in order"""
+    description = f"{mutation.field_name} batch of {len(repos)}"
+    variables = {f"m{index}": repo["id"] for index, repo in enumerate(repos)}
     try:
-        client.request(
-            REINDEX_MUTATION,
-            {"repository": repo_id},
-            request_description=f"Reindex repository {repo_id}",
+        response = client.request(
+            build_batched_mutation(mutation, len(repos)),
+            variables,
+            request_description=description,
+            allow_graphql_errors=True,
         )
-    except (GraphQLError, HTTPRequestError) as exc:
-        logger.warning("reindexRepository failed for %s: %s", repo_id, exc)
-        return False
-    return True
+    except (GraphQLError, HTTPRequestError) as error:
+        logger.warning("%s failed: %s", description, error)
+        return [MutationOutcome(f"{mutation.action} failed", str(error))] * len(repos)
+
+    # GraphQL errors carry the alias in path[0]; errors without a path (auth,
+    # validation, transport) apply to every alias in the request
+    messages_by_alias: dict[str, list[str]] = {}
+    request_messages: list[str] = []
+    for graphql_error in response.get("errors") or []:
+        message = graphql_error_message(graphql_error)
+        path = graphql_error.get("path") if isinstance(graphql_error, dict) else None
+        if isinstance(path, list) and path and isinstance(path[0], str):
+            messages_by_alias.setdefault(path[0], []).append(message)
+        else:
+            request_messages.append(message)
+    outcomes: list[MutationOutcome] = []
+    for index, repo in enumerate(repos):
+        outcome = mutation_outcome(
+            mutation,
+            messages_by_alias.get(f"m{index}", []) + request_messages,
+        )
+        if outcome.result:
+            logger.warning(
+                "%s for %s: %s", outcome.action, repo.get("name"), outcome.result
+            )
+        outcomes.append(outcome)
+    return outcomes
+
+
+@dataclass
+class PendingRepoRows:
+    """A processed repo whose CSV rows wait for its mutation outcomes"""
+
+    result: RepoProcessingResult
+    remaining: int
+    outcomes: list[MutationOutcome] = field(default_factory=list)
+
+    def action_cells(self) -> list[Any]:
+        """Return the `action` and `result` CSV cells in ACTION_COLUMNS order"""
+        return [
+            "; ".join(outcome.action for outcome in self.outcomes),
+            "; ".join(outcome.result for outcome in self.outcomes if outcome.result),
+        ]
+
+
+class MutationBatcher:
+    """Send repair mutations in aliased batches over a thread pool
+
+    Repos are released for CSV writing once every mutation requested for them
+    has an outcome, so rows carry the real action/result cells
+    """
+
+    def __init__(self, client: SourcegraphClient, concurrency: int) -> None:
+        self.client = client
+        self.max_in_flight = concurrency * 2
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        self.pending: dict[RepositoryMutation, list[PendingRepoRows]] = {}
+        self.in_flight: dict[
+            concurrent.futures.Future[list[MutationOutcome]],
+            list[PendingRepoRows],
+        ] = {}
+        self.ready: list[PendingRepoRows] = []
+        self.outcome_counts: collections.Counter[str] = collections.Counter()
+
+    def add(
+        self,
+        result: RepoProcessingResult,
+        mutations: list[RepositoryMutation],
+    ) -> list[PendingRepoRows]:
+        """Queue mutations for one repo; return repos whose outcomes are complete"""
+        pending = PendingRepoRows(result, len(mutations))
+        for mutation in mutations:
+            batch = self.pending.setdefault(mutation, [])
+            batch.append(pending)
+            if len(batch) >= MUTATION_BATCH_SIZE:
+                self.submit(mutation)
+        self.collect(block=False)
+        return self.take_ready()
+
+    def flush(self) -> list[PendingRepoRows]:
+        """Send partial batches, wait for every outcome, and stop the pool"""
+        for mutation in list(self.pending):
+            self.submit(mutation)
+        while self.in_flight:
+            self.collect(block=True)
+        self.executor.shutdown()
+        return self.take_ready()
+
+    def submit(self, mutation: RepositoryMutation) -> None:
+        batch = self.pending.pop(mutation, [])
+        if not batch:
+            return
+        while len(self.in_flight) >= self.max_in_flight:
+            self.collect(block=True)
+        future = self.executor.submit(
+            run_mutation_batch,
+            self.client,
+            mutation,
+            [pending.result.repo for pending in batch],
+        )
+        self.in_flight[future] = batch
+
+    def collect(self, *, block: bool) -> None:
+        if not self.in_flight:
+            return
+        done, _ = concurrent.futures.wait(
+            self.in_flight,
+            timeout=None if block else 0,
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        for future in done:
+            batch = self.in_flight.pop(future)
+            for pending, outcome in zip(batch, future.result()):
+                self.outcome_counts[outcome.action] += 1
+                pending.outcomes.append(outcome)
+                pending.remaining -= 1
+                if pending.remaining == 0:
+                    self.ready.append(pending)
+
+    def take_ready(self) -> list[PendingRepoRows]:
+        ready, self.ready = self.ready, []
+        return ready
 
 
 def sanitize_for_filename(text: str) -> str:
@@ -3427,29 +3673,29 @@ def repository_page_request_size(
 
 def fetch_repository_page(
     client: SourcegraphClient,
+    query: str,
     cursor: str | None,
     request_page_size: int,
+    description: str = "Repository listing page",
 ) -> RepositoryPage:
     """Fetch one repository listing page, reducing page size on field-count errors"""
     while True:
         start = time.monotonic()
         try:
             data = client.request(
-                client.context.repository_listing_query,
+                query,
                 {
                     "first": request_page_size,
                     "after": cursor,
                 },
-                request_description=(
-                    f"Repository listing page (first={request_page_size})"
-                ),
+                request_description=f"{description} (first={request_page_size})",
                 validate=validate_repository_connection,
             )
             elapsed = time.monotonic() - start
             cursor_label = "start" if cursor is None else "cursor"
             logger.info(
-                "Repository listing page query finished: first=%d, after=%s "
-                "[query took %.3fs]",
+                "%s query finished: first=%d, after=%s [query took %.3fs]",
+                description,
                 request_page_size,
                 cursor_label,
                 elapsed,
@@ -3474,12 +3720,122 @@ def fetch_repository_page(
             request_page_size = next_page_size
 
 
+def fetch_repository_pages(
+    client: SourcegraphClient,
+    query: str,
+    *,
+    page_size: int,
+    max_repos: int | None,
+    description: str = "Repository listing page",
+) -> Iterator[dict[str, Any]]:
+    """Yield repository connection pages, prefetching each next page in a thread"""
+    total_fetched = 0
+    current_page_size = page_size
+    request_page_size = repository_page_request_size(
+        current_page_size,
+        max_repos,
+        total_fetched,
+    )
+    if request_page_size is None:
+        return
+    page = fetch_repository_page(client, query, None, request_page_size, description)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as page_executor:
+        while True:
+            current_page_size = min(current_page_size, page.request_page_size)
+            connection = page.connection
+            total_fetched += len(connection["nodes"])
+            page_info: dict[str, Any] = connection["pageInfo"]
+            next_page = None
+            if page_info["hasNextPage"]:
+                next_request_page_size = repository_page_request_size(
+                    current_page_size,
+                    max_repos,
+                    total_fetched,
+                )
+                if next_request_page_size is not None:
+                    next_page = page_executor.submit(
+                        fetch_repository_page,
+                        client,
+                        query,
+                        page_info["endCursor"],
+                        next_request_page_size,
+                        description,
+                    )
+            yield connection
+            if next_page is None:
+                break
+            page = next_page.result()
+
+
+def fetch_failed_repos(
+    client: SourcegraphClient,
+    max_repos: int | None,
+    *,
+    page_size: int,
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    """Yield (index, target, repo) for the union of the server-side --failed filters
+
+    Repos are deduplicated by id across filters and re-checked with
+    has_cloning_error, so the result matches the cloning-errors set a full
+    listing would produce (for example, `lastError = ""` passes the server's
+    `failedFetch` filter but is not an error client-side)
+    """
+    queries = client.context.failed_repository_listing_queries
+    supported = {argument_name for argument_name, _ in queries}
+    missing = [name for name, _ in FAILED_REPOSITORY_FILTERS if name not in supported]
+    if missing:
+        die(
+            f"--failed needs repositories({', '.join(missing)}) filter argument(s), "
+            f"which {client.endpoint} (v{client.context.version}) does not support",
+        )
+    seen_ids: set[str] = set()
+    total_yielded = 0
+    # Upper bound: per-filter totalCounts overlap, and some rows fail the client check
+    target = 0
+    for argument_name, query in queries:
+        matched = 0
+        first_page = True
+        for connection in fetch_repository_pages(
+            client,
+            query,
+            page_size=page_size,
+            max_repos=max_repos,
+            description=f"Failed repository listing page ({argument_name})",
+        ):
+            if first_page:
+                target += connection["totalCount"]
+                logger.info(
+                    "Fetching %d repositories matching %s...",
+                    connection["totalCount"],
+                    argument_name,
+                )
+                first_page = False
+            bounded_target = target if max_repos is None else min(target, max_repos)
+            for repo in connection["nodes"]:
+                matched += 1
+                if repo["id"] in seen_ids or not has_cloning_error(repo):
+                    continue
+                seen_ids.add(repo["id"])
+                total_yielded += 1
+                yield total_yielded, bounded_target, repo
+                if max_repos is not None and total_yielded >= max_repos:
+                    logger.info("Reached --limit %d failed repositories", max_repos)
+                    return
+        logger.info(
+            "Fetched %d repositories matching %s; %d distinct failed repos so far",
+            matched,
+            argument_name,
+            total_yielded,
+        )
+
+
 def fetch_repos(
     client: SourcegraphClient,
     max_repos: int | None = None,
     *,
     page_size: int = PAGE_SIZE,
     scope_repo: str | None = None,
+    failed: bool = False,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples for a scoped repo or paged repo list"""
     if scope_repo is not None:
@@ -3491,69 +3847,36 @@ def fetch_repos(
         yield 1, 1, repo
         logger.info("Fetched 1/1 repositories...")
         return
-    total_fetched = 0
-    first_page = True
-    current_page_size = page_size
     logger.info(
         "GraphQL listing page size: %d (will retry smaller if Sourcegraph "
         "reports a field-count limit)",
-        current_page_size,
+        page_size,
     )
-    request_page_size = repository_page_request_size(
-        current_page_size,
-        max_repos,
-        total_fetched,
-    )
-    if request_page_size is None:
+    if failed:
+        yield from fetch_failed_repos(client, max_repos, page_size=page_size)
         return
-    page = fetch_repository_page(
+    total_fetched = 0
+    target = 0
+    for connection in fetch_repository_pages(
         client,
-        None,
-        request_page_size,
-    )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as page_executor:
-        while True:
-            current_page_size = min(current_page_size, page.request_page_size)
-            connection = page.connection
+        client.context.repository_listing_query,
+        page_size=page_size,
+        max_repos=max_repos,
+    ):
+        if total_fetched == 0:
             total_count = connection["totalCount"]
             target = (
                 min(max_repos, total_count) if max_repos is not None else total_count
             )
-            if first_page:
-                logger.info(
-                    "Fetching %d of %d total repositories...",
-                    target,
-                    total_count,
-                )
-                first_page = False
-
-            nodes: list[dict[str, Any]] = connection["nodes"]
-            total_after_page = total_fetched + len(nodes)
-            page_info: dict[str, Any] = connection["pageInfo"]
-            next_page = None
-            if page_info["hasNextPage"]:
-                next_request_page_size = repository_page_request_size(
-                    current_page_size,
-                    max_repos,
-                    total_after_page,
-                )
-                if next_request_page_size is not None:
-                    next_page = page_executor.submit(
-                        fetch_repository_page,
-                        client,
-                        page_info["endCursor"],
-                        next_request_page_size,
-                    )
-
-            for repo in nodes:
-                total_fetched += 1
-                yield total_fetched, target, repo
-
-            logger.info("Fetched %d/%d repositories...", total_fetched, target)
-
-            if next_page is None:
-                break
-            page = next_page.result()
+            logger.info(
+                "Fetching %d of %d total repositories...",
+                target,
+                total_count,
+            )
+        for repo in connection["nodes"]:
+            total_fetched += 1
+            yield total_fetched, target, repo
+        logger.info("Fetched %d/%d repositories...", total_fetched, target)
 
 
 def extract_csv_values(
@@ -3631,6 +3954,7 @@ def csv_columns_for(
     *,
     count_commits: bool,
     run_search: bool = False,
+    actions: bool = False,
 ) -> list[str]:
     """Return base columns plus enabled optional column blocks"""
     cols = list(base_columns)
@@ -3638,6 +3962,8 @@ def csv_columns_for(
         cols.extend(name for name, _, _, _ in COMMIT_COUNT_COLUMNS)
     if run_search:
         cols.extend(name for name, _, _, _ in RUN_SEARCH_COLUMNS)
+    if actions:
+        cols.extend(name for name, _, _, _ in ACTION_COLUMNS)
     return cols
 
 
@@ -3830,6 +4156,7 @@ def append_processing_result_columns(
     *,
     count_commits: bool,
     run_search: bool,
+    action_cells: list[Any] | None = None,
 ) -> list[Any]:
     """Append optional column blocks from a processed repo result"""
     with_commit = append_commit_count(
@@ -3840,7 +4167,7 @@ def append_processing_result_columns(
         result.optimization_values,
         count_commits=count_commits,
     )
-    return append_run_search(
+    with_search = append_run_search(
         with_commit,
         result.search_match_count,
         result.search_elapsed_seconds,
@@ -3848,6 +4175,7 @@ def append_processing_result_columns(
         result.search_alert_title,
         run_search=run_search,
     )
+    return with_search if action_cells is None else [*with_search, *action_cells]
 
 
 def log_processing_result(
@@ -3911,6 +4239,7 @@ def iter_repo_processing_results(
     *,
     page_size: int,
     scope_repo: str | None,
+    failed: bool,
     count_commits: bool,
     count_commits_rev: str,
     run_search_pattern: str | None,
@@ -3925,6 +4254,7 @@ def iter_repo_processing_results(
         max_repos,
         page_size=page_size,
         scope_repo=scope_repo,
+        failed=failed,
     )
     use_threads = concurrency > 1 and (
         count_commits or run_search_pattern is not None or skipped_file_reasons
@@ -4002,10 +4332,11 @@ def write_csv(
     client: SourcegraphClient,
     max_repos: int | None = None,
     *,
-    reclone: bool = False,
+    mirror_mutation: RepositoryMutation | None = None,
     reindex: bool = False,
     count_commits: bool = False,
     scope_repo: str | None = None,
+    failed: bool = False,
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
     skipped_file_metrics: bool = False,
@@ -4013,54 +4344,34 @@ def write_csv(
     concurrency: int = DEFAULT_CONCURRENCY,
     stats: StatsCollector | None = None,
     unavailable_values: dict[str, str],
-) -> tuple[int, int, int]:
-    """Stream repos to CSVs and optionally trigger reclone/reindex mutations"""
+) -> tuple[int, collections.Counter[str]]:
+    """Stream repos to CSVs, optionally sending fetch/reclone/reindex mutations
+
+    Returns the repo count and a count per mutation outcome (`action` cell)
+    """
     run_search_enabled = run_search_pattern is not None
     skipped_file_reasons_enabled = skipped_file_reason_writer is not None
+    actions_enabled = mirror_mutation is not None or reindex
+    error_detection_available = "mirrorInfo.status" not in unavailable_values
 
-    total = 0
-    reclone_total = 0
-    reindex_total = 0
-    for result in iter_repo_processing_results(
-        client,
-        max_repos,
-        page_size=page_size,
-        scope_repo=scope_repo,
-        count_commits=count_commits,
-        count_commits_rev=count_commits_rev,
-        run_search_pattern=run_search_pattern,
-        skipped_file_reasons=skipped_file_reasons_enabled,
-        skipped_file_metrics=skipped_file_metrics,
-        unavailable_values=unavailable_values,
-        concurrency=concurrency,
-    ):
+    def write_repo_rows(
+        result: RepoProcessingResult,
+        action_cells: list[Any] | None,
+    ) -> None:
         repo = result.repo
         row = result.row
-        log_processing_result(
-            result,
-            count_commits=count_commits,
-            run_search_pattern=run_search_pattern,
-        )
         output_writer.writerow(
             append_processing_result_columns(
                 row,
                 result,
                 count_commits=count_commits,
                 run_search=run_search_enabled,
+                action_cells=action_cells,
             ),
         )
-        total += 1
         if stats is not None:
             stats.add(repo)
-        repo_has_cloning_error = (
-            "mirrorInfo.status" not in unavailable_values and has_cloning_error(repo)
-        )
-        repo_has_indexing_error = (
-            "mirrorInfo.status" not in unavailable_values
-            and "textSearchIndex.status" not in unavailable_values
-            and has_indexing_error(repo)
-        )
-        if repo_has_cloning_error:
+        if error_detection_available and has_cloning_error(repo):
             cloning_writer.writerow(
                 append_processing_result_columns(
                     row
@@ -4072,27 +4383,19 @@ def write_csv(
                     result,
                     count_commits=count_commits,
                     run_search=run_search_enabled,
+                    action_cells=action_cells,
                 ),
             )
-        # In single-repo (scope_repo) mode the user explicitly asked for
-        # this repo, so trigger the mutation regardless of error state. In
-        # full-repo mode keep the existing "only fix repos with errors"
-        # guard so a blanket --reclone doesn't reclone the whole instance
-        if reclone and (scope_repo is not None or repo_has_cloning_error):
-            if trigger_reclone(client, repo["id"]):
-                reclone_total += 1
-        if repo_has_indexing_error:
+        if repo_has_indexing_error(repo):
             indexing_writer.writerow(
                 append_processing_result_columns(
                     row,
                     result,
                     count_commits=count_commits,
                     run_search=run_search_enabled,
+                    action_cells=action_cells,
                 ),
             )
-        if reindex and (scope_repo is not None or repo_has_indexing_error):
-            if trigger_reindex(client, repo["id"]):
-                reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
                 append_processing_result_columns(
@@ -4105,6 +4408,7 @@ def write_csv(
                     result,
                     count_commits=count_commits,
                     run_search=run_search_enabled,
+                    action_cells=action_cells,
                 ),
             )
         if skipped_file_reason_writer is not None:
@@ -4113,7 +4417,63 @@ def write_csv(
                 client.endpoint,
                 result.skipped_file_reason_search_results,
             )
-    return (total, reclone_total, reindex_total)
+
+    def repo_has_indexing_error(repo: dict[str, Any]) -> bool:
+        return (
+            error_detection_available
+            and "textSearchIndex.status" not in unavailable_values
+            and has_indexing_error(repo)
+        )
+
+    def requested_mutations(repo: dict[str, Any]) -> list[RepositoryMutation]:
+        # --fetch / --reclone reach here only with --failed (every listed repo
+        # has a cloning error) or a single REPO the user named explicitly.
+        # Bare --reindex scans every repo, so keep its indexing-error guard
+        mutations: list[RepositoryMutation] = []
+        if mirror_mutation is not None:
+            mutations.append(mirror_mutation)
+        if reindex and (scope_repo is not None or repo_has_indexing_error(repo)):
+            mutations.append(REINDEX_MUTATION)
+        return mutations
+
+    batcher = MutationBatcher(client, concurrency)
+    if actions_enabled:
+        logger.info(
+            "Mutation batching: %d per GraphQL request, %d concurrent request(s)",
+            MUTATION_BATCH_SIZE,
+            concurrency,
+        )
+    for result in iter_repo_processing_results(
+        client,
+        max_repos,
+        page_size=page_size,
+        scope_repo=scope_repo,
+        failed=failed,
+        count_commits=count_commits,
+        count_commits_rev=count_commits_rev,
+        run_search_pattern=run_search_pattern,
+        skipped_file_reasons=skipped_file_reasons_enabled,
+        skipped_file_metrics=skipped_file_metrics,
+        unavailable_values=unavailable_values,
+        concurrency=concurrency,
+    ):
+        log_processing_result(
+            result,
+            count_commits=count_commits,
+            run_search_pattern=run_search_pattern,
+        )
+        if not actions_enabled:
+            write_repo_rows(result, None)
+            continue
+        mutations = requested_mutations(result.repo)
+        if not mutations:
+            write_repo_rows(result, ["listed", ""])
+            continue
+        for pending in batcher.add(result, mutations):
+            write_repo_rows(pending.result, pending.action_cells())
+    for pending in batcher.flush():
+        write_repo_rows(pending.result, pending.action_cells())
+    return output_writer.count, batcher.outcome_counts
 
 
 def log_http_error(exc: HTTPRequestError) -> None:
@@ -4323,15 +4683,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=("Run PATTERN once per repo and append result columns"),
     )
     parser.add_argument(
-        "--reclone",
+        "--failed",
+        action="store_true",
+        help=(
+            "List only repos with cloning errors, using Sourcegraph's "
+            "server-side failedFetch, corrupted, and cloneStatus filters "
+            "instead of scanning every repo\n"
+            "Required by --fetch / --reclone without REPO"
+        ),
+    )
+    mirror_mutations = parser.add_mutually_exclusive_group()
+    mirror_mutations.add_argument(
+        "--fetch",
         nargs="?",
         const=True,
         default=False,
         metavar="REPO",
         help=(
-            "With REPO: reclone only that repository\n"
-            "Without REPO: reclone repos with cloning errors"
+            "Queue a fetch (updateMirrorRepository) for every --failed repo, "
+            "or for REPO"
         ),
+    )
+    mirror_mutations.add_argument(
+        "--reclone",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO",
+        help=("Delete and reclone (recloneRepository) every --failed repo, or REPO"),
     )
     parser.add_argument(
         "--reindex",
@@ -4361,7 +4740,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="int",
         help=(
             "Concurrent per-repo query threads for --count-commits and "
-            f"--run-search (default {DEFAULT_CONCURRENCY})"
+            "--run-search, and concurrent mutation requests of "
+            f"{MUTATION_BATCH_SIZE} repos each for --fetch / --reclone / "
+            f"--reindex (default {DEFAULT_CONCURRENCY})"
         ),
     )
     parser.add_argument(
@@ -4395,7 +4776,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "SRC_ACCESS_TOKEN environment variable"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    for flag_name, value in (("--fetch", args.fetch), ("--reclone", args.reclone)):
+        if value is True and not args.failed:
+            parser.error(f"{flag_name} without REPO requires --failed")
+    if args.failed and collect_scope(args) is not None:
+        parser.error(
+            "--failed lists every failed repo; drop --failed or the REPO argument"
+        )
+    return args
 
 
 def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
@@ -4404,6 +4793,7 @@ def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
         (flag_name, value)
         for flag_name, value in (
             ("--count-commits", args.count_commits),
+            ("--fetch", args.fetch),
             ("--reclone", args.reclone),
             ("--reindex", args.reindex),
         )
@@ -4458,9 +4848,10 @@ def log_run_configuration(
         scope_repo, scope_rev = scope
         logger.info(
             "Scoped run: repository=%s, rev=%s "
-            "(reclone=%s, reindex=%s, count-commits=%s)",
+            "(fetch=%s, reclone=%s, reindex=%s, count-commits=%s)",
             scope_repo,
             scope_rev,
+            bool(args.fetch),
             bool(args.reclone),
             bool(args.reindex),
             bool(args.count_commits),
@@ -4468,6 +4859,11 @@ def log_run_configuration(
     else:
         scope_repo = None
         scope_rev = "HEAD"
+    if args.failed:
+        logger.info(
+            "Scope: repos with cloning errors, via server-side %s filters",
+            ", ".join(argument_name for argument_name, _ in FAILED_REPOSITORY_FILTERS),
+        )
     return scope_repo, scope_rev
 
 
@@ -4508,10 +4904,11 @@ def initialize_run(
     )
 
     # Refuse admin-only mutations before a run starts emitting per-repo warnings
-    if not context.is_site_admin and (args.reclone or args.reindex):
+    if not context.is_site_admin and (args.fetch or args.reclone or args.reindex):
         flags = ", ".join(
             flag
             for flag, set_ in (
+                ("--fetch", bool(args.fetch)),
                 ("--reclone", bool(args.reclone)),
                 ("--reindex", bool(args.reindex)),
             )
@@ -4545,6 +4942,8 @@ def run_targeted_skipped_file_report(
     ignored = [
         flag
         for flag, set_ in (
+            ("--failed", args.failed),
+            ("--fetch", args.fetch),
             ("--reclone", args.reclone),
             ("--reindex", args.reindex),
             ("--limit", args.limit is not None),
@@ -4615,8 +5014,8 @@ class ExportSummary:
     indexing_errors: int
     skipped_files: int
     skipped_file_reasons: int
-    recloned: int
-    reindexed: int
+    # Repos per mutation outcome, keyed by the CSV `action` cell
+    mutation_outcomes: collections.Counter[str]
 
 
 def execute_export(
@@ -4630,42 +5029,27 @@ def execute_export(
     """Open output writers and execute the full repository export"""
 
     stats = StatsCollector() if args.stats else None
-    count_commits_enabled = bool(args.count_commits)
     run_search_pattern: str | None = args.run_search
-    run_search_enabled = run_search_pattern is not None
-    output_writer = LazyCSVWriter(
-        paths.repositories,
-        csv_columns_for(
-            CSV_COLUMNS,
-            count_commits=count_commits_enabled,
-            run_search=run_search_enabled,
-        ),
+    mirror_mutation = (
+        FETCH_MUTATION if args.fetch else RECLONE_MUTATION if args.reclone else None
     )
+
+    def columns_for(base_columns: list[str]) -> list[str]:
+        return csv_columns_for(
+            base_columns,
+            count_commits=bool(args.count_commits),
+            run_search=run_search_pattern is not None,
+            actions=mirror_mutation is not None or bool(args.reindex),
+        )
+
+    output_writer = LazyCSVWriter(paths.repositories, columns_for(CSV_COLUMNS))
     cloning_writer = LazyCSVWriter(
         paths.cloning_errors,
-        csv_columns_for(
-            CLONING_ERROR_CSV_COLUMNS,
-            count_commits=count_commits_enabled,
-            run_search=run_search_enabled,
-        ),
+        columns_for(CLONING_ERROR_CSV_COLUMNS),
     )
-    indexing_writer = LazyCSVWriter(
-        paths.indexing_errors,
-        csv_columns_for(
-            CSV_COLUMNS,
-            count_commits=count_commits_enabled,
-            run_search=run_search_enabled,
-        ),
-    )
+    indexing_writer = LazyCSVWriter(paths.indexing_errors, columns_for(CSV_COLUMNS))
     skipped_writer = (
-        LazyCSVWriter(
-            paths.skipped_files,
-            csv_columns_for(
-                SKIPPED_FILES_CSV_COLUMNS,
-                count_commits=count_commits_enabled,
-                run_search=run_search_enabled,
-            ),
-        )
+        LazyCSVWriter(paths.skipped_files, columns_for(SKIPPED_FILES_CSV_COLUMNS))
         if paths.skipped_files is not None
         else None
     )
@@ -4693,7 +5077,7 @@ def execute_export(
         skipped_cm,
         skipped_file_reason_cm,
     ):
-        total, reclone_total, reindex_total = write_csv(
+        total, mutation_outcomes = write_csv(
             output_writer,
             cloning_writer,
             indexing_writer,
@@ -4701,10 +5085,11 @@ def execute_export(
             skipped_file_reason_writer,
             client,
             args.limit,
-            reclone=bool(args.reclone),
+            mirror_mutation=mirror_mutation,
             reindex=bool(args.reindex),
             count_commits=bool(args.count_commits),
             scope_repo=scope_repo,
+            failed=args.failed,
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
             skipped_file_metrics=args.skipped_file_metrics,
@@ -4730,8 +5115,7 @@ def execute_export(
             if skipped_file_reason_writer is not None
             else 0
         ),
-        recloned=reclone_total,
-        reindexed=reindex_total,
+        mutation_outcomes=mutation_outcomes,
     )
 
 
@@ -4772,10 +5156,8 @@ def log_export_summary(
             summary.skipped_file_reasons,
             paths.skipped_file_reasons.name,
         )
-    if args.reclone:
-        logger.info("Triggered recloneRepository for %d repo(s)", summary.recloned)
-    if args.reindex:
-        logger.info("Triggered reindexRepository for %d repo(s)", summary.reindexed)
+    for action, count in sorted(summary.mutation_outcomes.items()):
+        logger.info("%s: %d repo(s)", action, count)
 
 
 def run(

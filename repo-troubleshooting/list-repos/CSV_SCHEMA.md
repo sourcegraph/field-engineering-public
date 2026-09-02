@@ -38,10 +38,16 @@ sort
 | `repos-with-skipped-files.csv` | `url` |
 | `skipped-files-reason-details.csv` | `repository.name`, `rev`, `reason`, `file.extension`, `file.path` |
 
-The optional `--count-commits` and `--run-search` flags append extra
-columns to the repo-listing CSVs above, excluding the `--stats`
-files and the skipped-file reason detail CSV, in this order: main
-columns → per-CSV extras → commit-count columns → run-search columns
+The optional `--count-commits`, `--run-search`, and repair flags
+(`--fetch`, `--reclone`, `--reindex`) append extra columns to the
+repo-listing CSVs above, excluding the `--stats` files and the
+skipped-file reason detail CSV, in this order: main columns → per-CSV
+extras → commit-count columns → run-search columns → action columns
+
+`--failed` narrows every repo-listing CSV to repos with a cloning error,
+using Sourcegraph's server-side `failedFetch`, `corrupted`, and
+`cloneStatus: NOT_CLONED` filters, so `repos.csv` and
+`repos-with-cloning-errors.csv` then list the same repos
 
 ## Main columns
 
@@ -65,6 +71,8 @@ These are written to every repo-listing CSV file
 | `mirrorInfo.nextSyncAt` | timestamp | | Timestamp the repo is next scheduled to be synced from upstream |
 | `mirrorInfo.secondsUntilNextSyncAt` | integer | | Integer seconds remaining until `mirrorInfo.nextSyncAt` |
 | `mirrorInfo.updateSchedule.intervalSeconds` | integer | | Interval, in seconds, between scheduled mirror updates. Default max is 28800 seconds (8 hours), but is shortened for busy / popular repos |
+| `mirrorInfo.updateQueue.index` | integer | | Position of the repo in repo-updater's update queue. Repos being updated are moved to the end of the queue, so ignore this when `mirrorInfo.updateQueue.updating` is `True` |
+| `mirrorInfo.updateQueue.updating` | boolean | | `True` while repo-updater has a fetch or clone of this repo in progress |
 | `mirrorInfo.shard` | string | true | Pod name of the gitserver shard which holds this repo's clone |
 | `textSearchIndex.status` | enum (indexed, not_indexed) | | Search-index state, derived locally: `indexed` if Zoekt has built an index for this repo, `not_indexed` otherwise |
 | `textSearchIndex.lastIndexStatus` | enum (SUCCESS, FAILURE) | | Most recent persisted text search indexing attempt result. Blank when no attempt was reported |
@@ -143,6 +151,17 @@ Appended to CSV files when `--run-search PATTERN` is used
 | `runSearch.queryTimeSeconds` | float | | Wall-clock seconds the per-repo `--run-search` GraphQL request took |
 | `runSearch.limitHit` | boolean | | `True` when the search hit a limit, so the results are incomplete |
 | `runSearch.alertTitle` | string | | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed |
+
+## Action columns
+
+Appended to CSV files when `--fetch`, `--reclone`, or `--reindex` is used.
+Mutations are sent in aliased batches of 10 per GraphQL
+request, `--concurrency` requests at a time
+
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `action` | string | true | What the script did to this repo: `listed` when no mutation applied, otherwise `<fetch\|reclone\|reindex> <triggered\|skipped\|failed>`; semicolon-joined when several mutations applied |
+| `result` | string | true | GraphQL error or skip message for a `skipped` or `failed` action; blank when triggered |
 
 ## `--stats` files
 
