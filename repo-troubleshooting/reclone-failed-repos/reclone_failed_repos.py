@@ -329,8 +329,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def one_line(text: str | None) -> str:
-    """Collapse whitespace so multi-line API text fits one CSV cell / log line."""
-    return " ".join((text or "").split())
+    """Collapse whitespace so multi-line API text fits one CSV cell / log line.
+
+    Also flattens literal `\\n` / `\\t`, which appear when gitserver quotes
+    git's output inside the error message.
+    """
+    return " ".join((text or "").replace("\\n", " ").replace("\\t", " ").split())
 
 
 def relative_time(iso_timestamp: str | None, now: datetime) -> str:
