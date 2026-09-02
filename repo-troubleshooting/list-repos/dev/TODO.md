@@ -1,8 +1,10 @@
 # TODO
 
-- Verify whether `recloneRepository` and `reindexRepository` are idempotent. Until
-  then, avoid retrying a mutation after an ambiguous network failure, or verify
-  its resulting state before retrying.
+- Mutation batches (`--fetch`, `--reclone`, `--reindex`) go through the same
+  HTTP retry logic as queries. A retried reclone is reported as `skipped`
+  ("another reclone is in progress"); fetch and reindex only re-enqueue. Confirm
+  this against a real instance under a forced retry (e.g. a 503) before
+  relying on it.
 - Stream aggregate skipped-file results as each indexed ref completes to reduce
   peak client memory. First confirm that lowering retained results provides a
   meaningful improvement over the current bounded queue.
