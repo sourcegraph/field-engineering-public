@@ -410,28 +410,43 @@ def build_repo_node_fragment(
     return f"fragment RepoNodeFields on {repository_type} {{\n{rendered}\n}}\n"
 
 
-# Server-side `repositories(...)` filters unioned by --failed. Each argument's
-# SQL predicate (internal/database/repos.go): failedFetch → last_error IS NOT
-# NULL, corrupted → corrupted_at IS NOT NULL, cloneStatus → clone_status = X.
-# Sourcegraph ANDs the arguments, so each filter is a separate listing query
-FAILED_REPOSITORY_FILTERS: tuple[tuple[str, str], ...] = (
+# Server-side `repositories(...)` filters used by the --failed and --not-cloned
+# scopes. Each argument's SQL predicate (internal/database/repos.go):
+# failedFetch → last_error IS NOT NULL, corrupted → corrupted_at IS NOT NULL,
+# cloneStatus → clone_status = X. Sourcegraph ANDs the arguments, so each
+# filter is a separate listing query
+FILTERED_REPOSITORY_FILTERS: tuple[tuple[str, str], ...] = (
     ("failedFetch", "failedFetch: true"),
     ("corrupted", "corrupted: true"),
     ("cloneStatus", "cloneStatus: NOT_CLONED"),
 )
 
 
-def supported_failed_repository_filters(
+@dataclass(frozen=True)
+class RepositoryScope:
+    """A repo listing narrowed by server-side filters, then re-checked client-side
+
+    `filter_names` are the FILTERED_REPOSITORY_FILTERS argument names to union;
+    `accepts` drops rows the server matched that the scope does not want
+    """
+
+    flag: str
+    description: str
+    filter_names: tuple[str, ...]
+    accepts: Callable[[dict[str, Any]], bool]
+
+
+def supported_filtered_repository_filters(
     schema: GraphQLSchema,
 ) -> tuple[tuple[str, str], ...]:
-    """Return the --failed filters whose arguments exist on this instance's schema"""
+    """Return the scope filters whose arguments exist on this instance's schema"""
     arguments = schema.field_arguments.get(schema.query_type, {}).get(
         "repositories",
         frozenset(),
     )
     return tuple(
         (argument_name, filter_argument)
-        for argument_name, filter_argument in FAILED_REPOSITORY_FILTERS
+        for argument_name, filter_argument in FILTERED_REPOSITORY_FILTERS
         if argument_name in arguments
     )
 
@@ -841,6 +856,37 @@ def truncate_log_text(value: str, max_chars: int = LOG_ERROR_TEXT_MAX_CHARS) -> 
 def has_cloning_error(repo: dict[str, Any]) -> bool:
     """Return True for errored, corrupted, or not-yet-cloned repos"""
     return derive_mirror_status(repo) in {"errored", "corrupted", "not_cloned"}
+
+
+def has_failed_status(repo: dict[str, Any]) -> bool:
+    """Return True for errored or corrupted repos, cloned or not"""
+    return derive_mirror_status(repo) in {"errored", "corrupted"}
+
+
+def is_not_cloned(repo: dict[str, Any]) -> bool:
+    """Return True for repos with no clone on disk and no clone in progress
+
+    Mirrors the server's `cloneStatus: NOT_CLONED`, so a not-cloned repo whose
+    last clone attempt errored still counts
+    """
+    mirror: dict[str, Any] = repo.get("mirrorInfo") or {}
+    return not mirror.get("cloned") and not mirror.get("cloneInProgress")
+
+
+# A not-cloned repo with a lastError matches both scopes; fetch_scoped_repos
+# deduplicates by repo id when the two are combined
+FAILED_SCOPE = RepositoryScope(
+    flag="--failed",
+    description="repos with cloning errors",
+    filter_names=("failedFetch", "corrupted"),
+    accepts=has_failed_status,
+)
+NOT_CLONED_SCOPE = RepositoryScope(
+    flag="--not-cloned",
+    description="repos not yet cloned",
+    filter_names=("cloneStatus",),
+    accepts=is_not_cloned,
+)
 
 
 def has_indexing_error(repo: dict[str, Any]) -> bool:
@@ -2031,9 +2077,11 @@ repo-listing CSVs above, excluding the `--stats` files and the
 skipped-file reason detail CSV, in this order: main columns → per-CSV
 extras → commit-count columns → run-search columns → action columns
 
-`--failed` narrows every repo-listing CSV to repos with a cloning error,
-using Sourcegraph's server-side `failedFetch`, `corrupted`, and
-`cloneStatus: NOT_CLONED` filters, so `{DEFAULT_OUTPUT_FILE}` and
+`--failed` narrows every repo-listing CSV to errored or corrupted repos via
+Sourcegraph's server-side `failedFetch` and `corrupted` filters;
+`--not-cloned` narrows it to not-yet-cloned repos, errored or not, via
+`cloneStatus: NOT_CLONED`. Either or both may be given, and every repo they
+list has a cloning error, so `{DEFAULT_OUTPUT_FILE}` and
 `{DEFAULT_CLONING_ERRORS_FILE}` then list the same repos
 
 ## Main columns
@@ -2138,8 +2186,8 @@ class SourcegraphContext:
     can_read_protected_fields: bool
     schema: GraphQLSchema
     repository_listing_query: str
-    # (repositories argument name, listing query) per supported --failed filter
-    failed_repository_listing_queries: tuple[tuple[str, str], ...]
+    # (repositories argument name, listing query) per supported scope filter
+    filtered_repository_listing_queries: tuple[tuple[str, str], ...]
     single_repository_query: str
     commit_count_query: str
     skipped_file_ref_metadata_query: str
@@ -2648,7 +2696,7 @@ class SourcegraphClient:
                 schema,
                 can_read_protected_fields=can_read_protected_fields,
             ),
-            failed_repository_listing_queries=tuple(
+            filtered_repository_listing_queries=tuple(
                 (
                     argument_name,
                     build_repository_listing_query(
@@ -2658,7 +2706,7 @@ class SourcegraphClient:
                     ),
                 )
                 for argument_name, filter_argument in (
-                    supported_failed_repository_filters(schema)
+                    supported_filtered_repository_filters(schema)
                 )
             ),
             single_repository_query=build_single_repo_query(
@@ -3767,40 +3815,44 @@ def fetch_repository_pages(
             page = next_page.result()
 
 
-def fetch_failed_repos(
+def fetch_scoped_repos(
     client: SourcegraphClient,
+    scopes: tuple[RepositoryScope, ...],
     max_repos: int | None,
     *,
     page_size: int,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
-    """Yield (index, target, repo) for the union of the server-side --failed filters
+    """Yield (index, target, repo) for the union of the scopes' server-side filters
 
-    Repos are deduplicated by id across filters and re-checked with
-    has_cloning_error, so the result matches the cloning-errors set a full
-    listing would produce (for example, `lastError = ""` passes the server's
-    `failedFetch` filter but is not an error client-side)
+    Repos are deduplicated by id across filters and kept only when some scope
+    accepts them, so the result matches what a full listing would derive (for
+    example, `lastError = ""` passes the server's `failedFetch` filter but is
+    not an error client-side)
     """
-    queries = client.context.failed_repository_listing_queries
-    supported = {argument_name for argument_name, _ in queries}
-    missing = [name for name, _ in FAILED_REPOSITORY_FILTERS if name not in supported]
+    wanted = tuple(
+        dict.fromkeys(name for scope in scopes for name in scope.filter_names)
+    )
+    available = dict(client.context.filtered_repository_listing_queries)
+    missing = [name for name in wanted if name not in available]
     if missing:
+        flags = " ".join(scope.flag for scope in scopes)
         die(
-            f"--failed needs repositories({', '.join(missing)}) filter argument(s), "
+            f"{flags} needs repositories({', '.join(missing)}) filter argument(s), "
             f"which {client.endpoint} (v{client.context.version}) does not support",
         )
     seen_ids: set[str] = set()
     total_yielded = 0
     # Upper bound: per-filter totalCounts overlap, and some rows fail the client check
     target = 0
-    for argument_name, query in queries:
+    for argument_name in wanted:
         matched = 0
         first_page = True
         for connection in fetch_repository_pages(
             client,
-            query,
+            available[argument_name],
             page_size=page_size,
             max_repos=max_repos,
-            description=f"Failed repository listing page ({argument_name})",
+            description=f"Scoped repository listing page ({argument_name})",
         ):
             if first_page:
                 target += connection["totalCount"]
@@ -3813,16 +3865,18 @@ def fetch_failed_repos(
             bounded_target = target if max_repos is None else min(target, max_repos)
             for repo in connection["nodes"]:
                 matched += 1
-                if repo["id"] in seen_ids or not has_cloning_error(repo):
+                if repo["id"] in seen_ids or not any(
+                    scope.accepts(repo) for scope in scopes
+                ):
                     continue
                 seen_ids.add(repo["id"])
                 total_yielded += 1
                 yield total_yielded, bounded_target, repo
                 if max_repos is not None and total_yielded >= max_repos:
-                    logger.info("Reached --limit %d failed repositories", max_repos)
+                    logger.info("Reached --limit %d scoped repositories", max_repos)
                     return
         logger.info(
-            "Fetched %d repositories matching %s; %d distinct failed repos so far",
+            "Fetched %d repositories matching %s; %d distinct scoped repos so far",
             matched,
             argument_name,
             total_yielded,
@@ -3835,7 +3889,7 @@ def fetch_repos(
     *,
     page_size: int = PAGE_SIZE,
     scope_repo: str | None = None,
-    failed: bool = False,
+    scopes: tuple[RepositoryScope, ...] = (),
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples for a scoped repo or paged repo list"""
     if scope_repo is not None:
@@ -3852,8 +3906,8 @@ def fetch_repos(
         "reports a field-count limit)",
         page_size,
     )
-    if failed:
-        yield from fetch_failed_repos(client, max_repos, page_size=page_size)
+    if scopes:
+        yield from fetch_scoped_repos(client, scopes, max_repos, page_size=page_size)
         return
     total_fetched = 0
     target = 0
@@ -4239,7 +4293,7 @@ def iter_repo_processing_results(
     *,
     page_size: int,
     scope_repo: str | None,
-    failed: bool,
+    scopes: tuple[RepositoryScope, ...],
     count_commits: bool,
     count_commits_rev: str,
     run_search_pattern: str | None,
@@ -4254,7 +4308,7 @@ def iter_repo_processing_results(
         max_repos,
         page_size=page_size,
         scope_repo=scope_repo,
-        failed=failed,
+        scopes=scopes,
     )
     use_threads = concurrency > 1 and (
         count_commits or run_search_pattern is not None or skipped_file_reasons
@@ -4336,7 +4390,7 @@ def write_csv(
     reindex: bool = False,
     count_commits: bool = False,
     scope_repo: str | None = None,
-    failed: bool = False,
+    scopes: tuple[RepositoryScope, ...] = (),
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
     skipped_file_metrics: bool = False,
@@ -4426,8 +4480,8 @@ def write_csv(
         )
 
     def requested_mutations(repo: dict[str, Any]) -> list[RepositoryMutation]:
-        # --fetch / --reclone reach here only with --failed (every listed repo
-        # has a cloning error) or a single REPO the user named explicitly.
+        # --fetch / --reclone reach here only with --failed / --not-cloned (every
+        # listed repo passed a scope) or a single REPO the user named explicitly.
         # Bare --reindex scans every repo, so keep its indexing-error guard
         mutations: list[RepositoryMutation] = []
         if mirror_mutation is not None:
@@ -4448,7 +4502,7 @@ def write_csv(
         max_repos,
         page_size=page_size,
         scope_repo=scope_repo,
-        failed=failed,
+        scopes=scopes,
         count_commits=count_commits,
         count_commits_rev=count_commits_rev,
         run_search_pattern=run_search_pattern,
@@ -4686,10 +4740,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--failed",
         action="store_true",
         help=(
-            "List only repos with cloning errors, using Sourcegraph's "
-            "server-side failedFetch, corrupted, and cloneStatus filters "
-            "instead of scanning every repo\n"
-            "Required by --fetch / --reclone without REPO"
+            "List only errored or corrupted repos, using Sourcegraph's "
+            "server-side failedFetch and corrupted filters instead of "
+            "scanning every repo\n"
+            "Combine with --not-cloned to list both sets"
+        ),
+    )
+    parser.add_argument(
+        "--not-cloned",
+        action="store_true",
+        help=(
+            "List only repos not yet cloned, whether or not their last clone "
+            "attempt errored, using Sourcegraph's server-side "
+            "cloneStatus: NOT_CLONED filter\n"
+            "Combine with --failed to list both sets"
         ),
     )
     mirror_mutations = parser.add_mutually_exclusive_group()
@@ -4700,8 +4764,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=False,
         metavar="REPO",
         help=(
-            "Queue a fetch (updateMirrorRepository) for every --failed repo, "
-            "or for REPO"
+            "Queue a fetch (updateMirrorRepository) for every --failed / "
+            "--not-cloned repo, or for REPO\n"
+            "Sourcegraph clones a not-yet-cloned repo instead of fetching it"
         ),
     )
     mirror_mutations.add_argument(
@@ -4710,7 +4775,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         const=True,
         default=False,
         metavar="REPO",
-        help=("Delete and reclone (recloneRepository) every --failed repo, or REPO"),
+        help=(
+            "Delete and reclone (recloneRepository) every --failed / "
+            "--not-cloned repo, or REPO"
+        ),
     )
     parser.add_argument(
         "--reindex",
@@ -4777,14 +4845,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
+    scopes = selected_scopes(args)
     for flag_name, value in (("--fetch", args.fetch), ("--reclone", args.reclone)):
-        if value is True and not args.failed:
-            parser.error(f"{flag_name} without REPO requires --failed")
-    if args.failed and collect_scope(args) is not None:
+        if value is True and not scopes:
+            parser.error(
+                f"{flag_name} without REPO requires --failed and/or --not-cloned"
+            )
+    if scopes and collect_scope(args) is not None:
+        flags = " ".join(scope.flag for scope in scopes)
         parser.error(
-            "--failed lists every failed repo; drop --failed or the REPO argument"
+            f"{flags} lists every matching repo; drop {flags} or the REPO argument"
         )
     return args
+
+
+def selected_scopes(args: argparse.Namespace) -> tuple[RepositoryScope, ...]:
+    """Return the listing scopes chosen by --failed / --not-cloned, in that order"""
+    return tuple(
+        scope
+        for scope, selected in (
+            (FAILED_SCOPE, args.failed),
+            (NOT_CLONED_SCOPE, args.not_cloned),
+        )
+        if selected
+    )
 
 
 def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
@@ -4859,10 +4943,11 @@ def log_run_configuration(
     else:
         scope_repo = None
         scope_rev = "HEAD"
-    if args.failed:
+    for scope in selected_scopes(args):
         logger.info(
-            "Scope: repos with cloning errors, via server-side %s filters",
-            ", ".join(argument_name for argument_name, _ in FAILED_REPOSITORY_FILTERS),
+            "Scope: %s, via server-side %s filter(s)",
+            scope.description,
+            ", ".join(scope.filter_names),
         )
     return scope_repo, scope_rev
 
@@ -4943,6 +5028,7 @@ def run_targeted_skipped_file_report(
         flag
         for flag, set_ in (
             ("--failed", args.failed),
+            ("--not-cloned", args.not_cloned),
             ("--fetch", args.fetch),
             ("--reclone", args.reclone),
             ("--reindex", args.reindex),
@@ -5089,7 +5175,7 @@ def execute_export(
             reindex=bool(args.reindex),
             count_commits=bool(args.count_commits),
             scope_repo=scope_repo,
-            failed=args.failed,
+            scopes=selected_scopes(args),
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
             skipped_file_metrics=args.skipped_file_metrics,

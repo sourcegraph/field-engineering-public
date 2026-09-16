@@ -71,20 +71,33 @@ python3 list-repos.py --run-search 'TODO patternType:literal'
 python3 list-repos.py --statistics
 ```
 
-### Failed repos
+### Failed and not-cloned repos
 
-`--failed` narrows the run to repos with cloning errors, using server-side
-filters (`failedFetch`, `corrupted`, `cloneStatus: NOT_CLONED`) instead of
-scanning every repo. The same client-side error detection is then applied, so
-the result matches `repos-with-cloning-errors.csv` from a full run, in a
-fraction of the time on large instances
+`--failed` and `--not-cloned` narrow the run using server-side filters instead
+of scanning every repo. The same client-side status detection is then applied,
+so the result matches the corresponding rows of `repos-with-cloning-errors.csv`
+from a full run, in a fraction of the time on large instances
+
+- `--failed`: errored or corrupted repos (`failedFetch`, `corrupted`)
+- `--not-cloned`: repos with no clone on disk (`cloneStatus: NOT_CLONED`),
+  whether or not their last clone attempt errored
+
+Pass both to list the union; a not-cloned repo with an error matches both and
+is listed once
 
 ```sh
 # List only repos with cloning errors
 python3 list-repos.py --failed
 
-# Trigger a fetch (updateMirrorRepository) on every failed repo
-python3 list-repos.py --failed --fetch
+# List only repos not yet cloned
+python3 list-repos.py --not-cloned
+
+# Clone every not-yet-cloned repo (updateMirrorRepository clones when
+# nothing is on disk)
+python3 list-repos.py --not-cloned --fetch
+
+# Fetch or clone every failed and not-cloned repo
+python3 list-repos.py --failed --not-cloned --fetch
 
 # Reclone (recloneRepository) every failed repo
 python3 list-repos.py --failed --reclone
@@ -93,7 +106,8 @@ python3 list-repos.py --failed --reclone
 ### Repair mutations
 
 Site admins can trigger repair mutations. `--fetch` and `--reclone` are
-mutually exclusive, and without a `REPO` they require `--failed`:
+mutually exclusive, and without a `REPO` they require `--failed` and/or
+`--not-cloned`:
 
 ```sh
 # Fetch or reclone one repo, whether in an error state or not
