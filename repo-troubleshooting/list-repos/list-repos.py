@@ -864,13 +864,17 @@ def has_failed_status(repo: dict[str, Any]) -> bool:
 
 
 def is_not_cloned(repo: dict[str, Any]) -> bool:
-    """Return True for repos never cloned and not in an error state"""
-    return derive_mirror_status(repo) == "not_cloned"
+    """Return True for repos with no clone on disk and no clone in progress
+
+    Mirrors the server's `cloneStatus: NOT_CLONED`, so a not-cloned repo whose
+    last clone attempt errored still counts
+    """
+    mirror: dict[str, Any] = repo.get("mirrorInfo") or {}
+    return not mirror.get("cloned") and not mirror.get("cloneInProgress")
 
 
-# The server's cloneStatus filter also matches not-cloned repos whose last
-# clone attempt errored; those belong to --failed, so each scope's `accepts`
-# re-checks the derived mirror status and the two never overlap
+# A not-cloned repo with a lastError matches both scopes; fetch_scoped_repos
+# deduplicates by repo id when the two are combined
 FAILED_SCOPE = RepositoryScope(
     flag="--failed",
     description="repos with cloning errors",
@@ -879,7 +883,7 @@ FAILED_SCOPE = RepositoryScope(
 )
 NOT_CLONED_SCOPE = RepositoryScope(
     flag="--not-cloned",
-    description="repos not yet cloned, excluding error states",
+    description="repos not yet cloned",
     filter_names=("cloneStatus",),
     accepts=is_not_cloned,
 )
@@ -2075,7 +2079,7 @@ extras → commit-count columns → run-search columns → action columns
 
 `--failed` narrows every repo-listing CSV to errored or corrupted repos via
 Sourcegraph's server-side `failedFetch` and `corrupted` filters;
-`--not-cloned` narrows it to not-yet-cloned repos without an error via
+`--not-cloned` narrows it to not-yet-cloned repos, errored or not, via
 `cloneStatus: NOT_CLONED`. Either or both may be given, and every repo they
 list has a cloning error, so `{DEFAULT_OUTPUT_FILE}` and
 `{DEFAULT_CLONING_ERRORS_FILE}` then list the same repos
@@ -3823,8 +3827,7 @@ def fetch_scoped_repos(
     Repos are deduplicated by id across filters and kept only when some scope
     accepts them, so the result matches what a full listing would derive (for
     example, `lastError = ""` passes the server's `failedFetch` filter but is
-    not an error client-side, and a not-cloned repo with a `lastError` belongs
-    to --failed rather than --not-cloned)
+    not an error client-side)
     """
     wanted = tuple(
         dict.fromkeys(name for scope in scopes for name in scope.filter_names)
@@ -4747,8 +4750,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--not-cloned",
         action="store_true",
         help=(
-            "List only repos not yet cloned and not in an error state, using "
-            "Sourcegraph's server-side cloneStatus: NOT_CLONED filter\n"
+            "List only repos not yet cloned, whether or not their last clone "
+            "attempt errored, using Sourcegraph's server-side "
+            "cloneStatus: NOT_CLONED filter\n"
             "Combine with --failed to list both sets"
         ),
     )

@@ -46,7 +46,7 @@ extras → commit-count columns → run-search columns → action columns
 
 `--failed` narrows every repo-listing CSV to errored or corrupted repos via
 Sourcegraph's server-side `failedFetch` and `corrupted` filters;
-`--not-cloned` narrows it to not-yet-cloned repos without an error via
+`--not-cloned` narrows it to not-yet-cloned repos, errored or not, via
 `cloneStatus: NOT_CLONED`. Either or both may be given, and every repo they
 list has a cloning error, so `repos.csv` and
 `repos-with-cloning-errors.csv` then list the same repos
