@@ -2063,7 +2063,7 @@ no rows
 | `{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
 | `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` finds at least one detail row | skipped-file reason columns |
-| `{DEFAULT_SKIPPED_FILE_REASON_STATS_FILE}` | targeted `--skipped-files-reason REPO[@REV]` finds at least one reason | `reason,count` |
+| `{DEFAULT_SKIPPED_FILE_REASON_STATS_FILE}` | `--skipped-files-reason` finds at least one reason | `reason,count` |
 | `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--stats` is set and repos were processed | `bucket,count` (see Stats section) |
 
 Row-bearing CSV files are sorted after writing with a bounded-memory external
@@ -3287,14 +3287,8 @@ def write_skipped_files_reason(
                 search_result.matches,
             ),
         )
-    reason_counts: collections.Counter[str] = collections.Counter()
-    for match in search_result.matches:
-        reason = skipped_file_reason_value(match)
-        if reason:
-            reason_counts[reason] += 1
-    details_writer = LazyCSVWriter(
+    details_writer = SkippedFileReasonCSVWriter(
         output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE,
-        [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS],
     )
     with details_writer as writer:
         write_skipped_file_reason_rows(
@@ -3302,15 +3296,7 @@ def write_skipped_files_reason(
             client.endpoint,
             [search_result],
         )
-    stats_writer = LazyCSVWriter(
-        output_dir / DEFAULT_SKIPPED_FILE_REASON_STATS_FILE,
-        ["reason", "count"],
-    )
-    with stats_writer as writer:
-        for reason, count in reason_counts.most_common():
-            writer.writerow([reason, count])
     logger.info("Wrote %d skipped-file match(es)", details_writer.count)
-    logger.info("Wrote %d NOT-INDEXED reason categor(ies)", stats_writer.count)
 
 
 # --- Repo CSV pipeline --------------------------------------------------------
@@ -3343,6 +3329,37 @@ class LazyCSVWriter:
     def __exit__(self, *_args: object) -> None:
         if self._file is not None:
             self._file.close()
+
+
+class SkippedFileReasonCSVWriter(LazyCSVWriter):
+    """Skipped-file details writer that also writes per-reason counts on close"""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS])
+        self.reason_column_index = self.columns.index("reason")
+        self.reason_counts: collections.Counter[str] = collections.Counter()
+
+    def writerow(self, row: list[Any]) -> None:
+        super().writerow(row)
+        reason = row[self.reason_column_index]
+        if reason:
+            self.reason_counts[reason] += 1
+
+    def __exit__(self, *args: object) -> None:
+        super().__exit__(*args)
+        stats_writer = LazyCSVWriter(
+            self.path.with_name(DEFAULT_SKIPPED_FILE_REASON_STATS_FILE),
+            ["reason", "count"],
+        )
+        with stats_writer as writer:
+            for reason, count in self.reason_counts.most_common():
+                writer.writerow([reason, count])
+        if stats_writer.count:
+            logger.info(
+                "Wrote %d NOT-INDEXED reason categor(ies) to %s",
+                stats_writer.count,
+                stats_writer.path.name,
+            )
 
 
 def csv_sort_key(row: list[str], column_indexes: list[int]) -> tuple[str, ...]:
@@ -4717,9 +4734,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="REPO[@REV]",
         default=None,
         help=(
-            "Write skipped-file details and reason counts for one repo\n"
-            "Without REPO, write one aggregate skipped-file details CSV for "
-            "all repos with skipped files"
+            "Write skipped-file details and per-reason counts for all repos "
+            "with skipped files\n"
+            "Optional REPO[@REV] scopes to one repo"
         ),
     )
     parser.add_argument(
@@ -5140,10 +5157,7 @@ def execute_export(
         else None
     )
     skipped_file_reason_writer = (
-        LazyCSVWriter(
-            paths.skipped_file_reasons,
-            [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS],
-        )
+        SkippedFileReasonCSVWriter(paths.skipped_file_reasons)
         if paths.skipped_file_reasons is not None
         else None
     )
