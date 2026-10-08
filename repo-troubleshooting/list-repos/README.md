@@ -73,14 +73,10 @@ python3 list-repos.py --run-search 'TODO patternType:literal'
 # Write size and index-ratio summary CSVs
 python3 list-repos.py --statistics
 
-# Reduce load on the instance by running fewer per-repo queries at once
-python3 list-repos.py --skipped-files-reason --concurrency 4
+# Balance script performance vs load on the SG instance by specifying
+# the number of searches run in parallel (default: 16)
+python3 list-repos.py --concurrency 4
 ```
-
-`--concurrency` (default 16) caps the per-repo query threads for
-`--count-commits`, `--run-search`, and `--skipped-files-reason`, and the
-mutation requests in flight for `--fetch`, `--reclone`, and `--reindex`.
-Plain listing runs one page at a time regardless
 
 ### Failed and not-cloned repos
 
