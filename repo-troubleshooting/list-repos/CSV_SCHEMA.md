@@ -24,7 +24,7 @@ no rows
 | `repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
 | `skipped-files-reason-details.csv` | `--skipped-files-reason` finds at least one detail row | skipped-file reason columns |
-| `skipped-files-reason-stats.csv` | targeted `--skipped-files-reason REPO[@REV]` finds at least one reason | `reason,count` |
+| `skipped-files-reason-stats.csv` | `--skipped-files-reason` finds at least one reason | `reason,count` |
 | `stats-*.csv` | `--stats` is set and repos were processed | `bucket,count` (see Stats section) |
 
 Row-bearing CSV files are sorted after writing with a bounded-memory external
