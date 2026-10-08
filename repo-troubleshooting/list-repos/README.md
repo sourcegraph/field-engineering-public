@@ -72,6 +72,10 @@ python3 list-repos.py --run-search 'TODO patternType:literal'
 
 # Write size and index-ratio summary CSVs
 python3 list-repos.py --statistics
+
+# Balance script performance vs load on the SG instance by specifying
+# the number of searches run in parallel (default: 16)
+python3 list-repos.py --concurrency 4
 ```
 
 ### Failed and not-cloned repos
