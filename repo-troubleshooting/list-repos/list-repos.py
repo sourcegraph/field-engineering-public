@@ -4824,10 +4824,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_CONCURRENCY,
         metavar="int",
         help=(
-            "Concurrent per-repo query threads for --count-commits and "
-            "--run-search, and concurrent mutation requests of "
-            f"{MUTATION_BATCH_SIZE} repos each for --fetch / --reclone / "
-            f"--reindex (default {DEFAULT_CONCURRENCY})"
+            "Concurrent per-repo query threads for --count-commits, "
+            "--run-search, and --skipped-files-reason, and concurrent "
+            f"mutation requests of {MUTATION_BATCH_SIZE} repos each for "
+            "--fetch / --reclone / --reindex\n"
+            f"Lower it to reduce load on the instance (default {DEFAULT_CONCURRENCY})"
         ),
     )
     parser.add_argument(
