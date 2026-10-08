@@ -4717,9 +4717,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="REPO[@REV]",
         default=None,
         help=(
-            "Write skipped-file details and reason counts for one repo\n"
-            "Without REPO, write one aggregate skipped-file details CSV for "
-            "all repos with skipped files"
+            "Write skipped-file details for all repos with skipped files\n"
+            "Optional REPO[@REV] scopes to one repo and also writes "
+            "per-reason counts"
         ),
     )
     parser.add_argument(

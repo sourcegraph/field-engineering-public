@@ -55,7 +55,10 @@ python3 list-repos.py --limit 100
 # Include repos whose latest index skipped files
 python3 list-repos.py --skipped-files
 
-# Explain skipped files for one repo and indexed revision
+# Explain skipped files for every repo with skipped files
+python3 list-repos.py --skipped-files-reason
+
+# Explain skipped files for one repo and indexed revision, with per-reason counts
 python3 list-repos.py --skipped-files-reason github.com/org/repo@main
 
 # Append per-repo commit counts and cleanup metadata
@@ -142,8 +145,8 @@ overwrite each other
 | `repos-with-indexing-errors.csv`    | When one or more cloned repos are missing a search index  |
 | `repos-with-skipped-files.csv`      | With `--skipped-files` and one or more skipped-file repos |
 | `stats-*.csv`                       | With `--statistics`                                       |
-| `skipped-files-reason-details.csv`  | With `--skipped-files-reason REPO[@REV]`                  |
-| `skipped-files-reason-stats.csv`    | With `--skipped-files-reason REPO[@REV]`                  |
+| `skipped-files-reason-details.csv`  | With `--skipped-files-reason [REPO[@REV]]`                |
+| `skipped-files-reason-stats.csv`    | With `--skipped-files-reason REPO[@REV]` (one repo only)  |
 
 - Optional columns from `--count-commits`, `--run-search`, and the repair
   mutations are appended to the per-repo CSVs
