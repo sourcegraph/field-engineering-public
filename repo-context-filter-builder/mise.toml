@@ -1,0 +1,14 @@
+[tools]
+python = "3.13"
+
+[tasks.setup]
+description = "Verify Python (standard library only; no dependencies to install)"
+run = "python --version"
+
+[tasks.check]
+description = "Check Python syntax"
+run = "python -m py_compile repo-context-filter-builder.py tests/test_builder.py"
+
+[tasks.test]
+description = "Run offline unit tests"
+run = "python -m unittest discover -s tests -v"
